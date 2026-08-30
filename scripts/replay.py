@@ -33,6 +33,7 @@ def summarize(records: list[dict], days: int | None, market: str | None) -> dict
     skips: Counter[str] = Counter()
     actions: Counter[str] = Counter()
     allocations: list[dict] = []
+    costs: list[dict] = []
 
     for record in records:
         when = parse_ts(record.get("ts", ""))
@@ -52,6 +53,8 @@ def summarize(records: list[dict], days: int | None, market: str | None) -> dict
             actions[record.get("action", "unknown")] += 1
         elif kind == "allocation":
             allocations.append(record)
+        elif kind == "cost":
+            costs.append(record)
 
     per_market: dict[str, dict] = defaultdict(
         lambda: {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "hold_hours": 0.0}
@@ -74,6 +77,11 @@ def summarize(records: list[dict], days: int | None, market: str | None) -> dict
         bucket["avg_hold_hours"] = round(bucket["hold_hours"] / trades, 2)
         bucket["pnl"] = round(bucket["pnl"], 2)
 
+    # Cost records are cumulative snapshots, so the last one is the running total.
+    latest_cost = costs[-1] if costs else {}
+    model_spend = float(latest_cost.get("cost_usd", 0) or 0)
+    total_pnl = round(sum(b["pnl"] for b in per_market.values()), 2)
+
     return {
         "buys": buys,
         "closes": closes,
@@ -81,8 +89,11 @@ def summarize(records: list[dict], days: int | None, market: str | None) -> dict
         "actions": actions,
         "allocations": allocations,
         "per_market": dict(per_market),
-        "total_pnl": round(sum(b["pnl"] for b in per_market.values()), 2),
+        "total_pnl": total_pnl,
         "deployed": round(sum(float(b.get("amount", 0) or 0) for b in buys), 2),
+        "model_spend": round(model_spend, 4),
+        "net_pnl": round(total_pnl - model_spend, 2),
+        "cost_detail": latest_cost,
     }
 
 
@@ -93,6 +104,9 @@ def render(summary: dict) -> str:
     lines.append(f"  positions closed  {len(summary['closes']):>12}")
     lines.append(f"  capital deployed  {'$' + format(summary['deployed'], ',.2f'):>12}")
     lines.append(f"  realised PnL      {'$' + format(summary['total_pnl'], ',.2f'):>12}")
+    if summary["model_spend"]:
+        lines.append(f"  model spend       {'$' + format(summary['model_spend'], ',.4f'):>12}")
+        lines.append(f"  net of inference  {'$' + format(summary['net_pnl'], ',.2f'):>12}")
     lines.append("")
 
     if summary["per_market"]:
@@ -118,6 +132,20 @@ def render(summary: dict) -> str:
         lines.append("  " + "-" * 58)
         for action, count in summary["actions"].most_common():
             lines.append(f"  {action:<40}{count:>6}")
+        lines.append("")
+
+    detail = summary["cost_detail"]
+    if detail:
+        lines.append("  Inference")
+        lines.append("  " + "-" * 58)
+        lines.append(
+            f"  {detail.get('calls', 0)} calls, "
+            f"{detail.get('fallbacks', 0)} fallbacks, "
+            f"{detail.get('sources_used', 0)} live-search sources, "
+            f"{detail.get('cache_hit_rate', 0):.0%} prompt cache"
+        )
+        for agent, spend in list((detail.get("by_agent") or {}).items())[:6]:
+            lines.append(f"    {agent:<38}${spend:>8.4f}")
         lines.append("")
 
     if summary["allocations"]:

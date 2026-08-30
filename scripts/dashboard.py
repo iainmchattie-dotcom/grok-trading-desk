@@ -42,6 +42,8 @@ def render(records: list[dict], budget: float | None = None) -> str:
     skips = Counter(r.get("reason", "?") for r in recent if r.get("type") == "skip")
     actions = Counter(r.get("action", "?") for r in recent if r.get("type") == "action")
     allocations = [r for r in records if r.get("type") == "allocation"]
+    cost_records = [r for r in records if r.get("type") == "cost"]
+    latest_cost = cost_records[-1] if cost_records else {}
 
     pnl = sum(float(r.get("pnl", 0) or 0) for r in closes)
     deployed = sum(float(r.get("amount", 0) or 0) for r in buys)
@@ -62,6 +64,11 @@ def render(records: list[dict], budget: float | None = None) -> str:
     row(f"closes      {len(closes):>4}")
     row(f"deployed    ${deployed:>10,.2f}")
     row(f"realised    ${pnl:>10,.2f}")
+    if latest_cost:
+        spend = float(latest_cost.get("cost_usd", 0) or 0)
+        row(f"inference   ${spend:>10,.4f}   ({latest_cost.get('calls', 0)} calls, "
+            f"{latest_cost.get('fallbacks', 0)} fallback)")
+        row(f"net         ${pnl - spend:>10,.2f}")
     if budget:
         row(f"budget use  {bar(min(1.0, deployed / budget))} {deployed / budget:>5.0%}")
     row("")
