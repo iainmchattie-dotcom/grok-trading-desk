@@ -45,8 +45,11 @@ class Token(BaseModel):
     age_seconds: float = 0.0
     buys: int = 0
     sells: int = 0
-    mint_revoked: bool = False
-    lp_burned: bool = False
+    # Tri-state on purpose. The create event carries neither, and `False` would
+    # be indistinguishable from "not checked" - which is what made the old
+    # require_mint_revoked filter reject every real token.
+    mint_revoked: bool | None = None
+    lp_burned: bool | None = None
     socials: dict[str, str] = Field(default_factory=dict)
 
     # -- straight off the create event (denominated in SOL) --

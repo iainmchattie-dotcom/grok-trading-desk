@@ -181,6 +181,19 @@ def test_stage_two_rejection_reasons(over, reason):
     assert filter_reason(watched_token(**over), WATCH_FILTER) == reason
 
 
+def test_unverified_mint_authority_is_not_a_rejection():
+    # The feed never reports it, so None must mean "ask the auditor", not "no".
+    strict = {**WATCH_FILTER, "require_mint_revoked": True, "require_lp_burned": True}
+    assert watched_token().mint_revoked is None
+    assert filter_reason(watched_token(), strict) is None
+
+
+def test_a_confirmed_live_mint_authority_still_rejects():
+    strict = {**WATCH_FILTER, "require_mint_revoked": True}
+    assert filter_reason(watched_token(mint_revoked=False), strict) == "mint_not_revoked"
+    assert filter_reason(watched_token(mint_revoked=True), strict) is None
+
+
 def test_absent_thresholds_are_not_failures():
     # An empty filter means "no opinion", not "reject everything".
     assert filter_reason(Token(mint="M"), {}) is None

@@ -164,10 +164,12 @@ def filter_reason(token: Token, filt: dict[str, Any]) -> str | None:
     if token.dev_sold:
         return "dev_sold"
 
-    if filt.get("require_mint_revoked") and not token.mint_revoked:
+    # Only enforce what has actually been checked: None means unknown, and an
+    # unknown is the auditor's problem, not a silent rejection here.
+    if filt.get("require_mint_revoked") and token.mint_revoked is False:
         return "mint_not_revoked"
 
-    if filt.get("require_lp_burned") and not token.lp_burned:
+    if filt.get("require_lp_burned") and token.lp_burned is False:
         return "lp_not_burned"
 
     return None
