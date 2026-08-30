@@ -17,6 +17,45 @@ from ..models import Market, Position
 log = logging.getLogger(__name__)
 
 
+class OrderRejected(Exception):
+    """A broker refusal that is expected and diagnosable, not a bug.
+
+    `reason` is a stable slug so the event log can be grouped by it.
+    """
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+        self.detail = detail
+
+
+def classify_rejection(exc: Exception) -> str:
+    """Map a broker error onto a stable skip reason.
+
+    A 403 on submit is almost always the PDT guard: Alpaca blocks the order
+    rather than let an account under $25k equity get flagged. Reporting that as
+    a generic failure hides a limit the desk should respect.
+    """
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    text = str(exc).lower()
+
+    if status == 403 or "pattern day" in text or "day trad" in text:
+        return "pdt_blocked"
+    if "wash trade" in text:
+        return "wash_trade_blocked"
+    if "insufficient" in text or "buying power" in text:
+        return "insufficient_buying_power"
+    if "not tradable" in text or "asset is not active" in text:
+        return "asset_not_tradable"
+    if "market is closed" in text or "outside" in text:
+        return "market_closed"
+    if status == 429:
+        return "broker_rate_limited"
+    return "order_rejected"
+
+
 class StockExecutor:
     """Bracket-order execution against Alpaca."""
 
@@ -77,6 +116,8 @@ class StockExecutor:
         if price <= 0:
             raise ValueError(f"{symbol}: cannot size an order at price {price}")
 
+        # Bracket orders cannot be fractional, so this floor is a hard rule and
+        # not a rounding convenience.
         qty = int(amount_usd // price)
         if qty < 1:
             return {"filled": False, "reason": "amount_below_one_share", "symbol": symbol}
@@ -93,7 +134,13 @@ class StockExecutor:
             take_profit=TakeProfitRequest(limit_price=take_profit),
             stop_loss=StopLossRequest(stop_price=stop_loss),
         )
-        order = await self._call(self.client.submit_order, request)
+        try:
+            order = await self._call(self.client.submit_order, request)
+        except Exception as exc:  # noqa: BLE001 - classified, then re-raised
+            reason = classify_rejection(exc)
+            log.warning("bracket buy %s rejected (%s): %s", symbol, reason, exc)
+            raise OrderRejected(reason, str(exc)) from exc
+
         log.info("submitted bracket buy %s x%d @ ~%.2f", symbol, qty, price)
         return {
             "filled": True,
@@ -127,15 +174,19 @@ class StockExecutor:
         if shares < 1:
             return {"filled": False, "reason": "qty_below_one_share", "symbol": symbol}
 
-        order = await self._call(
-            self.client.submit_order,
-            MarketOrderRequest(
-                symbol=symbol,
-                qty=shares,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.DAY,
-            ),
-        )
+        try:
+            order = await self._call(
+                self.client.submit_order,
+                MarketOrderRequest(
+                    symbol=symbol,
+                    qty=shares,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise OrderRejected(classify_rejection(exc), str(exc)) from exc
+
         return {"filled": True, "symbol": symbol, "qty": shares, "order_id": str(getattr(order, "id", ""))}
 
     async def close_position(self, symbol: str) -> dict[str, Any]:

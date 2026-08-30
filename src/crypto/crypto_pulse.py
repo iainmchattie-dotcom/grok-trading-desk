@@ -46,8 +46,8 @@ class CryptoPulse(GrokAgent):
         "max_search_results": 20,
     }
 
-    def __init__(self, config: dict[str, Any], client=None):
-        super().__init__(config, client)
+    def __init__(self, config: dict[str, Any], client=None, costs=None):
+        super().__init__(config, client, costs)
         minutes = ((config or {}).get("pulse", {}) or {}).get("crypto_cache_minutes", 15)
         self.cache_seconds = float(minutes) * 60.0
         self._cache: dict[str, Any] | None = None

@@ -21,6 +21,7 @@ from typing import Any
 
 import yaml
 
+from .base_agent import CostTracker
 from .crypto.auditor import Auditor
 from .crypto.crypto_checker import CryptoChecker
 from .crypto.crypto_executor import CryptoExecutor
@@ -32,6 +33,7 @@ from .models import Allocation, Market, Position
 from .shared.allocator import Allocator
 from .shared.exit_manager import ExitManager
 from .shared.log import EventLog
+from .shared.memory import OutcomeMemory
 from .shared.risk import RiskManager
 from .stocks.analyst import Analyst
 from .stocks.insider import Insider
@@ -39,7 +41,7 @@ from .stocks.market_pulse import MarketPulse
 from .stocks.radar import Radar
 from .stocks.screener import Screener
 from .stocks.stock_checker import StockChecker
-from .stocks.stock_executor import StockExecutor
+from .stocks.stock_executor import OrderRejected, StockExecutor
 from .stocks.stock_scoring import score_stock
 
 log = logging.getLogger("desk")
@@ -67,27 +69,38 @@ class TradingDesk:
 
         self.log = EventLog(config)
         self.risk = RiskManager(config)
+        # One tracker across every bot, so spend is a desk number not a per-bot one.
+        self.costs = CostTracker()
+        self.memory = OutcomeMemory(config, event_log=self.log)
+
+        def agent(cls):
+            return cls(config, costs=self.costs)
 
         # crypto side
         self.scout = Scout(config)
-        self.auditor = Auditor(config)
-        self.narrative = Narrative(config)
-        self.crypto_pulse = CryptoPulse(config)
-        self.crypto_checker = CryptoChecker(config)
+        self.auditor = agent(Auditor)
+        self.narrative = agent(Narrative)
+        self.crypto_pulse = agent(CryptoPulse)
+        self.crypto_checker = agent(CryptoChecker)
         self.crypto_executor = CryptoExecutor(config)
 
         # stock side
         self.screener = Screener(config)
-        self.analyst = Analyst(config)
-        self.radar = Radar(config)
-        self.insider = Insider(config)
-        self.market_pulse = MarketPulse(config)
-        self.stock_checker = StockChecker(config)
+        self.analyst = agent(Analyst)
+        self.radar = agent(Radar)
+        self.insider = agent(Insider)
+        self.market_pulse = agent(MarketPulse)
+        self.stock_checker = agent(StockChecker)
         self.stock_executor = StockExecutor(config, live_ack=live_ack)
 
         # shared
-        self.allocator = Allocator(config)
-        self.exit_manager = ExitManager(config)
+        self.allocator = agent(Allocator)
+        self.exit_manager = agent(ExitManager)
+
+        # Only the agents that decide get history; the analysts describe what is
+        # in front of them and should not be anchored by old trades.
+        for bot in (self.crypto_checker, self.stock_checker, self.exit_manager, self.allocator):
+            bot.memory = self.memory
 
         self.positions: list[Position] = []
         self.min_go_signal = float((config.get("pulse", {}) or {}).get("min_go_signal", 0.3))
@@ -95,6 +108,10 @@ class TradingDesk:
         self.exits_cfg = config.get("exits", {}) or {}
         self.last_stock_session: date | None = None
         self._lock = asyncio.Lock()
+        self._cost_report_every = int(
+            (config.get("logging", {}) or {}).get("cost_report_every", 25)
+        )
+        self._last_cost_report = 0
 
     # -- helpers -------------------------------------------------------------------
 
@@ -107,6 +124,23 @@ class TradingDesk:
             return datetime.now(ZoneInfo(tz_name))
         except Exception:  # noqa: BLE001 - missing tzdata must not stop the desk
             return datetime.now(timezone.utc) - timedelta(hours=4)
+
+    def maybe_report_costs(self) -> None:
+        """Emit a spend snapshot every N model calls."""
+        if self._cost_report_every <= 0:
+            return
+        if self.costs.calls - self._last_cost_report < self._cost_report_every:
+            return
+        self._last_cost_report = self.costs.calls
+        self.log.write("cost", **self.costs.snapshot())
+
+    def refresh_memory(self) -> int:
+        """Re-read the log so the next decision sees the latest outcomes."""
+        try:
+            return len(self.memory.load())
+        except Exception as exc:  # noqa: BLE001 - memory is an enhancement, not a gate
+            log.warning("could not refresh outcome memory: %s", exc)
+            return 0
 
     def market_is_open(self, now: datetime | None = None) -> bool:
         hours = self.config.get("market_hours", {}) or {}
@@ -135,7 +169,11 @@ class TradingDesk:
             weights=self.weights.get("crypto"),
             min_go_signal=self.min_go_signal,
         )
-        agent_scores = {"audit": audit, "narrative": narrative, "pulse": pulse, "matrix": verdict}
+        agent_scores = {
+            "audit": audit, "narrative": narrative, "pulse": pulse, "matrix": verdict,
+            "citations": self.auditor.last_citations + self.narrative.last_citations,
+        }
+        self.maybe_report_costs()
 
         if not verdict["buy"]:
             self.log.skip(Market.CRYPTO.value, token.symbol or token.mint, verdict["reason"],
@@ -147,6 +185,8 @@ class TradingDesk:
              "narrative": narrative, "pulse": pulse, "score": verdict}
         )
         agent_scores["checker"] = check
+        agent_scores["citations"] += self.crypto_checker.last_citations
+        self.maybe_report_costs()
         if not check["approve"]:
             self.log.skip(Market.CRYPTO.value, token.symbol or token.mint, "checker_rejected",
                           {"kill_reasons": check["kill_reasons"]})
@@ -222,8 +262,13 @@ class TradingDesk:
             weights=self.weights.get("stocks"),
             min_go_signal=self.min_go_signal,
         )
-        agent_scores = {"analyst": analyst, "radar": radar, "insider": insider,
-                        "pulse": pulse, "matrix": verdict}
+        agent_scores = {
+            "analyst": analyst, "radar": radar, "insider": insider,
+            "pulse": pulse, "matrix": verdict, "sector": stock.sector,
+            "citations": (self.analyst.last_citations + self.radar.last_citations
+                          + self.insider.last_citations),
+        }
+        self.maybe_report_costs()
 
         if not verdict["buy"]:
             self.log.skip(Market.STOCKS.value, stock.symbol, verdict["reason"],
@@ -235,6 +280,8 @@ class TradingDesk:
              "insider": insider, "pulse": pulse, "score": verdict}
         )
         agent_scores["checker"] = check
+        agent_scores["citations"] += self.stock_checker.last_citations
+        self.maybe_report_costs()
         if not check["approve"]:
             self.log.skip(Market.STOCKS.value, stock.symbol, "checker_rejected",
                           {"kill_reasons": check["kill_reasons"]})
@@ -259,13 +306,20 @@ class TradingDesk:
                              agent_scores, amount, tx_id="DRY_RUN")
                 return {"bought": True, "dry_run": True, "amount": amount}
 
-            fill = await self.stock_executor.buy_bracket(
-                stock.symbol,
-                amount,
-                stock.price,
-                stop_pct=check["suggested_stop_pct"],
-                target_pct=check["suggested_target_pct"],
-            )
+            try:
+                fill = await self.stock_executor.buy_bracket(
+                    stock.symbol,
+                    amount,
+                    stock.price,
+                    stop_pct=check["suggested_stop_pct"],
+                    target_pct=check["suggested_target_pct"],
+                )
+            except OrderRejected as rejection:
+                # PDT blocks and wash-trade refusals are broker policy, not bugs.
+                self.log.skip(Market.STOCKS.value, stock.symbol, rejection.reason,
+                              rejection.detail)
+                return {"bought": False, "reason": rejection.reason}
+
             if not fill.get("filled"):
                 self.log.skip(Market.STOCKS.value, stock.symbol, fill.get("reason", "not_filled"))
                 return {"bought": False, "reason": fill.get("reason", "not_filled")}
@@ -292,6 +346,7 @@ class TradingDesk:
 
     async def run_stock_session(self) -> list[dict[str, Any]]:
         """One pass of the equity workflow: pulse -> screen -> evaluate."""
+        self.refresh_memory()
         pulse = await self.market_pulse.run()
         if pulse["go_signal"] < self.min_go_signal:
             self.log.skip(Market.STOCKS.value, "*", "veto_market_paused",
@@ -386,6 +441,9 @@ class TradingDesk:
         except NotImplementedError as exc:
             self.log.skip(position.market.value, position.symbol,
                           "executor_not_implemented", str(exc))
+        except OrderRejected as rejection:
+            self.log.skip(position.market.value, position.symbol,
+                          rejection.reason, rejection.detail)
         except Exception as exc:  # noqa: BLE001
             log.exception("failed to %s %s", action, position.symbol)
             self.log.skip(position.market.value, position.symbol, "action_failed", str(exc))
@@ -393,6 +451,7 @@ class TradingDesk:
         return decision
 
     async def run_exit_pass(self) -> list[dict[str, Any]]:
+        self.refresh_memory()
         positions = await self.refresh_positions()
         log.info("exit pass over %d positions", len(positions))
         return [await self.manage_position(p) for p in list(positions)]
@@ -432,6 +491,7 @@ class TradingDesk:
         return totals
 
     async def run_allocation(self) -> Allocation:
+        self.refresh_memory()
         crypto_pulse, market_pulse = await asyncio.gather(
             self.crypto_pulse.run(), self.market_pulse.run()
         )
@@ -441,6 +501,7 @@ class TradingDesk:
         applied = self.risk.set_allocation(allocation)
         self.log.allocation(round(applied.crypto_pct, 4), round(applied.stocks_pct, 4),
                             allocation.reason)
+        self.log.write("cost", **self.costs.snapshot())
         return applied
 
     async def allocator_loop(self, interval_seconds: float = 86400.0) -> None:
@@ -458,10 +519,14 @@ class TradingDesk:
 
     async def run(self) -> None:
         log.info(
-            "desk starting — dry_run=%s, stock execution=%s",
+            "desk starting — dry_run=%s, stock execution=%s, models=%s/%s, live_search=%s",
             self.dry_run,
             "paper" if self.stock_executor.paper else "LIVE",
+            self.analyst.model,
+            self.stock_checker.model,
+            self.analyst.live_search,
         )
+        log.info("outcome memory: %d closed trades loaded", self.refresh_memory())
         await asyncio.gather(
             self.crypto_loop(),
             self.stock_loop(),
