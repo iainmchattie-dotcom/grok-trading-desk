@@ -50,6 +50,13 @@ class CryptoChecker(GrokAgent):
     def facts(self, payload: dict[str, Any]) -> dict[str, Any]:
         return payload
 
+    def memory_context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from ..models import Market
+
+        token = payload.get("token") or {}
+        theme = (payload.get("narrative") or {}).get("theme", "")
+        return self.memory.context(Market.CRYPTO, symbol=token.get("symbol", ""), theme=theme)
+
     def postprocess(self, data: dict[str, Any]) -> dict[str, Any]:
         return {
             "approve": bool(data.get("approve", False)),

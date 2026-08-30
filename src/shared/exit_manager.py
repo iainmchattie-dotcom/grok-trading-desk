@@ -72,6 +72,12 @@ class ExitManager(GrokAgent):
             "entry_meta": position.meta,
         }
 
+    def memory_context(self, payload: Position | dict[str, Any]) -> dict[str, Any]:
+        position = payload if isinstance(payload, Position) else Position(**payload)
+        return self.memory.context(
+            position.market, symbol=position.symbol, sector=position.sector
+        )
+
     def postprocess(self, data: dict[str, Any]) -> dict[str, Any]:
         raw_action = str(data.get("action", "")).strip().upper()
         try:

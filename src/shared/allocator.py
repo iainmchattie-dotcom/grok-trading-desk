@@ -41,6 +41,16 @@ class Allocator(GrokAgent):
     def facts(self, payload: dict[str, Any]) -> dict[str, Any]:
         return payload
 
+    def memory_context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from ..models import Market
+
+        return {
+            "track_record": {
+                "crypto": self.memory.summary(Market.CRYPTO),
+                "stocks": self.memory.summary(Market.STOCKS),
+            }
+        }
+
     def postprocess(self, data: dict[str, Any]) -> dict[str, Any]:
         try:
             crypto = float(data["crypto_pct"])

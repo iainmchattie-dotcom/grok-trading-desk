@@ -49,6 +49,14 @@ class StockChecker(GrokAgent):
     def facts(self, payload: dict[str, Any]) -> dict[str, Any]:
         return payload
 
+    def memory_context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from ..models import Market
+
+        stock = payload.get("stock") or {}
+        return self.memory.context(
+            Market.STOCKS, symbol=stock.get("symbol", ""), sector=stock.get("sector", "")
+        )
+
     def postprocess(self, data: dict[str, Any]) -> dict[str, Any]:
         def pct(key: str, default: float) -> float:
             try:

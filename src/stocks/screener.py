@@ -6,7 +6,9 @@ data API and keeps only the names worth spending LLM calls on.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ..models import Stock
@@ -37,7 +39,12 @@ def parse_stock(payload: dict[str, Any]) -> Stock:
 
 
 def filter_reason(stock: Stock, filt: dict[str, Any]) -> str | None:
-    """Return the reason the stock is rejected, or None if it passes."""
+    """Return the reason the stock is rejected, or None if it passes.
+
+    Thresholds whose datum is missing are skipped rather than failed. Alpaca
+    exposes no sector and no market cap (see RESEARCH.md), so treating an absent
+    value as a rejection would reject the entire universe.
+    """
     if not stock.symbol:
         return "no_symbol"
 
@@ -49,34 +56,41 @@ def filter_reason(stock: Stock, filt: dict[str, Any]) -> str | None:
     if max_price is not None and stock.price > max_price:
         return "price_too_high"
 
-    min_avg_vol = filt.get("min_avg_volume")
-    if min_avg_vol is not None and stock.avg_volume < min_avg_vol:
-        return "illiquid"
+    if stock.avg_volume > 0:
+        min_avg_vol = filt.get("min_avg_volume")
+        if min_avg_vol is not None and stock.avg_volume < min_avg_vol:
+            return "illiquid"
 
-    min_cap = filt.get("min_market_cap")
-    if min_cap is not None and stock.market_cap < min_cap:
-        return "market_cap_too_small"
+    # market cap has no Alpaca source; 0 means "unknown", not "tiny"
+    if stock.market_cap > 0:
+        min_cap = filt.get("min_market_cap")
+        if min_cap is not None and stock.market_cap < min_cap:
+            return "market_cap_too_small"
 
-    max_cap = filt.get("max_market_cap")
-    if max_cap is not None and stock.market_cap > max_cap:
-        return "market_cap_too_large"
+        max_cap = filt.get("max_market_cap")
+        if max_cap is not None and stock.market_cap > max_cap:
+            return "market_cap_too_large"
 
-    min_rel_vol = filt.get("min_rel_volume")
-    if min_rel_vol is not None and stock.rel_volume < min_rel_vol:
-        return "no_relative_volume"
+    if stock.avg_volume > 0 and stock.volume > 0:
+        min_rel_vol = filt.get("min_rel_volume")
+        if min_rel_vol is not None and stock.rel_volume < min_rel_vol:
+            return "no_relative_volume"
 
-    gap = abs(stock.gap_pct)
-    min_gap = filt.get("min_gap_pct")
-    if min_gap is not None and gap < min_gap:
-        return "gap_too_small"
+    if stock.prev_close > 0:
+        gap = abs(stock.gap_pct)
+        min_gap = filt.get("min_gap_pct")
+        if min_gap is not None and gap < min_gap:
+            return "gap_too_small"
 
-    max_gap = filt.get("max_gap_pct")
-    if max_gap is not None and gap > max_gap:
-        return "gap_too_large"
+        max_gap = filt.get("max_gap_pct")
+        if max_gap is not None and gap > max_gap:
+            return "gap_too_large"
 
-    excluded = {s.lower() for s in (filt.get("excluded_sectors") or [])}
-    if stock.sector.lower() in excluded:
-        return "excluded_sector"
+    # sector likewise has no Alpaca source; "unknown" is not an exclusion
+    if stock.sector and stock.sector != "unknown":
+        excluded = {s.lower() for s in (filt.get("excluded_sectors") or [])}
+        if stock.sector.lower() in excluded:
+            return "excluded_sector"
 
     return None
 
@@ -117,35 +131,105 @@ class Screener:
         return self.screen(rows, limit=limit)
 
     async def _fetch_alpaca(self) -> list[dict[str, Any]]:
-        """Pull the day's most active names from Alpaca's screener endpoint."""
-        import httpx
+        """Compose today's universe from three endpoints.
 
-        alpaca = self.config.get("alpaca", {}) or {}
-        headers = {
-            "APCA-API-KEY-ID": alpaca.get("api_key", ""),
-            "APCA-API-SECRET-KEY": alpaca.get("api_secret", ""),
-        }
-        async with httpx.AsyncClient(timeout=30) as client:
-            movers = await client.get(
-                "https://data.alpaca.markets/v1beta1/screener/stocks/movers",
-                headers=headers,
-                params={"top": 50},
-            )
-            movers.raise_for_status()
-            body = movers.json()
+        No single Alpaca endpoint carries what the filter needs. Movers gives
+        {symbol, percent_change, change, price}; most-actives gives
+        {symbol, volume, trade_count}; neither carries a previous close or an
+        average volume. So: take the union of both for the candidate set, read
+        real closes and volumes off the snapshot endpoint, and compute a true
+        20-day average volume from daily bars.
+        """
+        symbols = await self._candidate_symbols()
+        if not symbols:
+            return []
+        snapshots = await self._snapshots(symbols)
+        averages = await self._average_volumes(symbols)
 
         rows: list[dict[str, Any]] = []
-        for bucket in ("gainers", "losers"):
-            for item in body.get(bucket, []):
-                price = float(item.get("price", 0) or 0)
-                change_pct = float(item.get("percent_change", 0) or 0) / 100.0
-                prev_close = price / (1 + change_pct) if change_pct != -1 else 0.0
-                rows.append(
-                    {
-                        "symbol": item.get("symbol"),
-                        "price": price,
-                        "prev_close": prev_close,
-                        **{k: v for k, v in item.items() if k not in {"symbol", "price"}},
-                    }
-                )
+        for symbol in symbols:
+            snapshot = snapshots.get(symbol)
+            if snapshot is None:
+                continue
+            daily = getattr(snapshot, "daily_bar", None)
+            previous = getattr(snapshot, "previous_daily_bar", None)
+            latest = getattr(snapshot, "latest_trade", None)
+
+            price = float(getattr(latest, "price", 0) or getattr(daily, "close", 0) or 0)
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "price": price,
+                    "prev_close": float(getattr(previous, "close", 0) or 0),
+                    "volume": float(getattr(daily, "volume", 0) or 0),
+                    "avg_volume": averages.get(symbol, 0.0),
+                    # market_cap and sector are deliberately absent: Alpaca has
+                    # no source for them, and the filter skips what it lacks.
+                }
+            )
         return rows
+
+    async def _candidate_symbols(self) -> list[str]:
+        """Union of the movers and most-actives lists."""
+        from alpaca.data.historical.screener import ScreenerClient
+        from alpaca.data.requests import MarketMoversRequest, MostActivesRequest
+
+        alpaca = self.config.get("alpaca", {}) or {}
+        client = ScreenerClient(
+            api_key=alpaca.get("api_key", ""), secret_key=alpaca.get("api_secret", "")
+        )
+        top = int((self.config.get("stock_filter", {}) or {}).get("universe_size", 50))
+
+        movers = await asyncio.to_thread(
+            client.get_market_movers, MarketMoversRequest(top=top)
+        )
+        actives = await asyncio.to_thread(
+            client.get_most_actives, MostActivesRequest(top=top)
+        )
+
+        symbols: list[str] = []
+        for mover in list(getattr(movers, "gainers", [])) + list(getattr(movers, "losers", [])):
+            symbols.append(str(mover.symbol).upper())
+        for active in getattr(actives, "most_actives", []):
+            symbols.append(str(active.symbol).upper())
+
+        seen: set[str] = set()
+        return [s for s in symbols if not (s in seen or seen.add(s))]
+
+    async def _snapshots(self, symbols: list[str]) -> dict[str, Any]:
+        """Latest trade, today's bar and yesterday's close, per symbol."""
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockSnapshotRequest
+
+        alpaca = self.config.get("alpaca", {}) or {}
+        client = StockHistoricalDataClient(
+            api_key=alpaca.get("api_key", ""), secret_key=alpaca.get("api_secret", "")
+        )
+        return await asyncio.to_thread(
+            client.get_stock_snapshot, StockSnapshotRequest(symbol_or_symbols=symbols)
+        )
+
+    async def _average_volumes(self, symbols: list[str], days: int = 20) -> dict[str, float]:
+        """True average daily volume, which no screener endpoint reports."""
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+
+        alpaca = self.config.get("alpaca", {}) or {}
+        client = StockHistoricalDataClient(
+            api_key=alpaca.get("api_key", ""), secret_key=alpaca.get("api_secret", "")
+        )
+        request = StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=TimeFrame.Day,
+            start=datetime.now(timezone.utc) - timedelta(days=days * 2),
+        )
+        bars = await asyncio.to_thread(client.get_stock_bars, request)
+
+        averages: dict[str, float] = {}
+        data = getattr(bars, "data", {}) or {}
+        for symbol, series in data.items():
+            volumes = [float(bar.volume) for bar in series[-days:] if bar.volume]
+            if volumes:
+                averages[str(symbol).upper()] = sum(volumes) / len(volumes)
+        return averages

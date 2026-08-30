@@ -167,6 +167,9 @@ class GrokAgent:
 
         self._client = client
         self.costs = costs if costs is not None else CostTracker()
+        #: Optional OutcomeMemory. When set, `facts()` output is augmented with
+        #: what happened on comparable past trades.
+        self.memory: Any = None
         self.last_citations: list[str] = []
         self.last_usage: dict[str, Any] = {}
 
@@ -176,6 +179,11 @@ class GrokAgent:
         """The variable half of the prompt. Subclasses narrow this to what matters."""
         return payload
 
+    def memory_context(self, payload: Any) -> dict[str, Any]:
+        """Past-outcome block for this payload. Subclasses that can be matched
+        against history override this; the default recalls nothing."""
+        return {}
+
     def build_messages(self, payload: Any) -> list[dict[str, str]]:
         """Static instructions first, variable facts second.
 
@@ -183,6 +191,9 @@ class GrokAgent:
         opening block is what makes `cached_tokens` non-zero.
         """
         facts = self.facts(payload)
+        recalled = self.memory_context(payload) if self.memory is not None else {}
+        if recalled and isinstance(facts, dict):
+            facts = {**facts, **recalled}
         rendered = json.dumps(facts, default=str, indent=None) if facts is not None else "{}"
         return [
             {"role": "system", "content": self.PROMPT},

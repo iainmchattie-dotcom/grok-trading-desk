@@ -103,3 +103,36 @@ async def test_screener_run_uses_injected_fetch():
     screener = Screener({"stock_filter": FILT}, fetch=fetch)
     result = await screener.run()
     assert [s.symbol for s in result] == ["AAA"]
+
+
+# --- missing data must not reject the universe -------------------------------------
+# Alpaca exposes no sector and no market cap; the old filter treated both as 0
+# and rejected every candidate on min_market_cap.
+
+def test_unknown_market_cap_is_not_a_rejection():
+    assert filter_reason(good_stock(market_cap=0), FILT) is None
+
+
+def test_unknown_sector_is_never_excluded():
+    assert filter_reason(good_stock(sector="unknown"), FILT) is None
+    # but a known, excluded sector still is
+    assert filter_reason(good_stock(sector="biotech"), FILT) == "excluded_sector"
+
+
+def test_a_known_market_cap_is_still_enforced():
+    assert filter_reason(good_stock(market_cap=1_000_000), FILT) == "market_cap_too_small"
+
+
+def test_missing_average_volume_skips_the_volume_filters():
+    thin = good_stock(avg_volume=0, volume=0)
+    assert filter_reason(thin, FILT) is None
+
+
+def test_missing_previous_close_skips_the_gap_filter():
+    assert filter_reason(good_stock(prev_close=0), FILT) is None
+
+
+def test_a_row_with_only_a_price_survives():
+    # the minimum a snapshot can yield and still be worth an LLM call
+    bare = parse_stock({"symbol": "AAA", "price": 50.0})
+    assert filter_reason(bare, FILT) is None
