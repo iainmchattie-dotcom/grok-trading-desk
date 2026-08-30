@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..base_agent import GrokAgent, clamp01
+from ..base_agent import BOOL, TEXT, UNIT, GrokAgent, clamp01, schema, string_list
 
 PROMPT = """You are the final adversarial reviewer before real money buys this token.
 
@@ -28,11 +28,27 @@ Schema: {"approve": bool, "confidence": float 0..1, "kill_reasons": [string],
 
 class CryptoChecker(GrokAgent):
     name = "crypto_checker"
-    model_tier = "full"
+    model_tier = "deep"
     PROMPT = PROMPT
+    SCHEMA = schema(
+        {
+            "approve": BOOL,
+            "confidence": UNIT,
+            "kill_reasons": string_list(),
+            "worst_case": TEXT,
+            "adjusted_score": UNIT,
+        }
+    )
+    # The checker gets its own look at the evidence rather than trusting the
+    # generators' summary of it.
+    SEARCH = {
+        "mode": "auto",
+        "sources": [{"type": "x", "post_view_count": 500}, {"type": "web"}],
+        "max_search_results": 15,
+    }
 
-    def build_prompt(self, payload: dict[str, Any]) -> str:
-        return f"{self.PROMPT}\n\nCANDIDATE:\n{payload}"
+    def facts(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return payload
 
     def postprocess(self, data: dict[str, Any]) -> dict[str, Any]:
         return {

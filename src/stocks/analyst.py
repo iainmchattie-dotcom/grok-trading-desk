@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..base_agent import GrokAgent, clamp01
+from ..base_agent import NUM, TEXT, UNIT, GrokAgent, clamp01, enum, schema, string_list
 from ..models import Stock
 
 PROMPT = """You analyse one US equity on both fundamentals and price action.
@@ -27,10 +27,32 @@ class Analyst(GrokAgent):
     name = "analyst"
     model_tier = "fast"
     PROMPT = PROMPT
+    SCHEMA = schema(
+        {
+            "fundamentals_score": UNIT,
+            "technicals_score": UNIT,
+            "trend": enum("up", "sideways", "down"),
+            "support": NUM,
+            "resistance": NUM,
+            "valuation": enum("cheap", "fair", "expensive"),
+            "thesis": TEXT,
+            "risks": string_list(),
+        }
+    )
+    # Fundamentals live in filings and financial press, not on X.
+    SEARCH = {
+        "mode": "on",
+        "sources": [
+            {"type": "web", "allowed_websites": ["sec.gov", "reuters.com", "bloomberg.com",
+                                                 "finance.yahoo.com", "marketwatch.com"]},
+            {"type": "news"},
+        ],
+        "max_search_results": 20,
+    }
 
-    def build_prompt(self, payload: Stock | dict[str, Any]) -> str:
+    def facts(self, payload: Stock | dict[str, Any]) -> dict[str, Any]:
         stock = payload if isinstance(payload, Stock) else Stock(**payload)
-        facts = {
+        return {
             "symbol": stock.symbol,
             "name": stock.name,
             "sector": stock.sector,
@@ -42,7 +64,6 @@ class Analyst(GrokAgent):
             "rel_volume": round(stock.rel_volume, 3),
             "market_cap": stock.market_cap,
         }
-        return f"{self.PROMPT}\n\nSTOCK:\n{facts}"
 
     def postprocess(self, data: dict[str, Any]) -> dict[str, Any]:
         def num(key: str) -> float:

@@ -5,9 +5,10 @@
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from typing import Any
 
-from ..base_agent import GrokAgent, clamp01
+from ..base_agent import TEXT, UNIT, GrokAgent, clamp01, schema, string_list
 from ..models import Stock
 
 PROMPT = """You scan recent news and social sentiment for one US equity.
@@ -30,17 +31,38 @@ class Radar(GrokAgent):
     name = "radar"
     model_tier = "fast"
     PROMPT = PROMPT
+    SCHEMA = schema(
+        {
+            "sentiment_score": UNIT,
+            "news_momentum": UNIT,
+            "controversy": UNIT,
+            "catalysts": string_list(),
+            "headline_risk": TEXT,
+            "summary": TEXT,
+        }
+    )
+    SEARCH = {
+        "mode": "on",
+        "sources": [{"type": "news"}, {"type": "x", "post_view_count": 1000}, {"type": "web"}],
+        "max_search_results": 25,
+    }
 
-    def build_prompt(self, payload: Stock | dict[str, Any]) -> str:
+    def facts(self, payload: Stock | dict[str, Any]) -> dict[str, Any]:
         stock = payload if isinstance(payload, Stock) else Stock(**payload)
-        facts = {
+        return {
             "symbol": stock.symbol,
             "name": stock.name,
             "sector": stock.sector,
             "price": stock.price,
             "gap_pct": round(stock.gap_pct, 4),
         }
-        return f"{self.PROMPT}\n\nSTOCK:\n{facts}"
+
+    def search_parameters(self) -> dict[str, Any] | None:
+        params = super().search_parameters()
+        if params is not None:
+            # The prompt asks for two weeks; make the retrieval agree with it.
+            params["from_date"] = (date.today() - timedelta(days=14)).isoformat()
+        return params
 
     def postprocess(self, data: dict[str, Any]) -> dict[str, Any]:
         return {

@@ -27,7 +27,7 @@ async def test_analyst_parses_full_answer(client_factory):
     assert result["fundamentals_score"] == 0.72
     assert result["support"] == 45.5
     assert result["risks"] == ["guidance"]
-    assert client.calls[0]["json"]["model"] == "grok-4-fast"
+    assert client.calls[0]["json"]["model"] == "grok-4.3"
 
 
 async def test_analyst_falls_back_to_zeros(client_factory, no_sleep):
@@ -81,7 +81,7 @@ async def test_insider_fallback_trips_the_selling_veto(client_factory, no_sleep)
     assert result["insider_buying"] == 0.0    # < 0.2
 
 
-async def test_stock_checker_uses_the_full_model(client_factory):
+async def test_stock_checker_uses_the_deep_model(client_factory):
     client = client_factory(
         {"approve": True, "confidence": 0.8, "adjusted_score": 0.71,
          "suggested_stop_pct": 0.06, "suggested_target_pct": 0.18}
@@ -89,7 +89,7 @@ async def test_stock_checker_uses_the_full_model(client_factory):
     result = await StockChecker(CONFIG, client=client).run({"symbol": "ACME"})
     assert result["approve"] is True
     assert result["suggested_stop_pct"] == 0.06
-    assert client.calls[0]["json"]["model"] == "grok-4"
+    assert client.calls[0]["json"]["model"] == "grok-4.6"
 
 
 async def test_stock_checker_rejects_on_failure(client_factory, no_sleep):

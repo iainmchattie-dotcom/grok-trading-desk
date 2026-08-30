@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..base_agent import GrokAgent, clamp01
+from ..base_agent import NUM, TEXT, UNIT, GrokAgent, clamp01, enum, schema
 from ..models import ExitAction, Position
 
 PROMPT = """You manage one open trading position. Decide what to do with it right now.
@@ -38,10 +38,25 @@ class ExitManager(GrokAgent):
     name = "exit_manager"
     model_tier = "fast"
     PROMPT = PROMPT
+    SCHEMA = schema(
+        {
+            "action": enum("HOLD", "TIGHTEN", "TRIM", "CLOSE"),
+            "reason": TEXT,
+            "confidence": UNIT,
+            "new_stop_pct": NUM,
+            "trim_fraction": NUM,
+        }
+    )
+    # Whether the entry thesis still holds is a question about today's news.
+    SEARCH = {
+        "mode": "auto",
+        "sources": [{"type": "news"}, {"type": "x", "post_view_count": 1000}],
+        "max_search_results": 10,
+    }
 
-    def build_prompt(self, payload: Position | dict[str, Any]) -> str:
+    def facts(self, payload: Position | dict[str, Any]) -> dict[str, Any]:
         position = payload if isinstance(payload, Position) else Position(**payload)
-        facts = {
+        return {
             "market": position.market.value,
             "symbol": position.symbol,
             "entry_price": position.entry_price,
@@ -56,7 +71,6 @@ class ExitManager(GrokAgent):
             "entry_score": position.score,
             "entry_meta": position.meta,
         }
-        return f"{self.PROMPT}\n\nPOSITION:\n{facts}"
 
     def postprocess(self, data: dict[str, Any]) -> dict[str, Any]:
         raw_action = str(data.get("action", "")).strip().upper()

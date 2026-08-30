@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..base_agent import GrokAgent, clamp01
+from ..base_agent import BOOL, TEXT, UNIT, GrokAgent, clamp01, schema, string_list
 from ..models import Token
 
 PROMPT = """You audit Solana pump.fun token launches for wallet-level manipulation.
@@ -34,10 +34,28 @@ class Auditor(GrokAgent):
     name = "auditor"
     model_tier = "fast"
     PROMPT = PROMPT
+    SCHEMA = schema(
+        {
+            "coordinated_buys": BOOL,
+            "wash_trading": BOOL,
+            "bundled_launch": BOOL,
+            "sniper_pct": UNIT,
+            "insider_pct": UNIT,
+            "safety_score": UNIT,
+            "red_flags": string_list(),
+        }
+    )
+    # Deployer wallets and rug post-mortems surface on X long before anywhere
+    # else. Engagement floor keeps out the bot replies that quote every mint.
+    SEARCH = {
+        "mode": "auto",
+        "sources": [{"type": "x", "post_view_count": 500}, {"type": "web"}],
+        "max_search_results": 10,
+    }
 
-    def build_prompt(self, payload: Token | dict[str, Any]) -> str:
+    def facts(self, payload: Token | dict[str, Any]) -> dict[str, Any]:
         token = payload if isinstance(payload, Token) else Token(**payload)
-        facts = {
+        return {
             "mint": token.mint,
             "symbol": token.symbol,
             "creator": token.creator,
@@ -52,8 +70,9 @@ class Auditor(GrokAgent):
             "buy_sell_ratio": round(token.buy_sell_ratio, 3),
             "mint_revoked": token.mint_revoked,
             "lp_burned": token.lp_burned,
+            "unique_traders": token.unique_traders,
+            "observed_seconds": token.observed_seconds,
         }
-        return f"{self.PROMPT}\n\nTOKEN:\n{facts}"
 
     def postprocess(self, data: dict[str, Any]) -> dict[str, Any]:
         return {

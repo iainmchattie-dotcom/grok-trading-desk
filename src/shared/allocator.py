@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..base_agent import GrokAgent
+from ..base_agent import TEXT, UNIT, GrokAgent, schema
 from ..models import Allocation
 
 PROMPT = """You allocate one trading desk's daily budget between two markets:
@@ -34,9 +34,12 @@ class Allocator(GrokAgent):
     name = "allocator"
     model_tier = "fast"
     PROMPT = PROMPT
+    SCHEMA = schema({"crypto_pct": UNIT, "stocks_pct": UNIT, "reason": TEXT})
+    # Both pulses are already in the payload; no extra retrieval needed.
+    SEARCH = None
 
-    def build_prompt(self, payload: dict[str, Any]) -> str:
-        return f"{self.PROMPT}\n\nSTATE:\n{payload}"
+    def facts(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return payload
 
     def postprocess(self, data: dict[str, Any]) -> dict[str, Any]:
         try:

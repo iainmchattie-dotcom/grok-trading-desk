@@ -66,9 +66,11 @@ async def test_allocate_allows_zeroing_one_market(client_factory):
 async def test_allocate_sends_both_pulses_and_pnl_to_the_model(client_factory):
     client = client_factory({"crypto_pct": 0.5, "stocks_pct": 0.5})
     await Allocator(CONFIG, client=client).allocate(CRYPTO_PULSE, MARKET_PULSE, PNL)
-    sent = client.calls[0]["json"]["messages"][0]["content"]
+    body = client.calls[0]["json"]
+    # static instructions first (cacheable prefix), variable facts second
+    assert "Reply ONLY JSON" in body["messages"][0]["content"]
+    sent = body["messages"][1]["content"]
     assert "crypto_pulse" in sent and "market_pulse" in sent and "weekly_pnl_usd" in sent
-    assert "Reply ONLY JSON" in sent
 
 
 def test_allocation_normalized_handles_a_degenerate_split():

@@ -26,7 +26,12 @@ class ExitAction(str, Enum):
 
 
 class Token(BaseModel):
-    """A pump.fun launch as seen by the scout."""
+    """A pump.fun launch.
+
+    Fields split into two groups. The first is what a `subscribeNewToken` event
+    actually carries; the second is what the watch window measures afterwards.
+    Only the first is populated at creation time.
+    """
 
     mint: str
     symbol: str = ""
@@ -43,6 +48,22 @@ class Token(BaseModel):
     mint_revoked: bool = False
     lp_burned: bool = False
     socials: dict[str, str] = Field(default_factory=dict)
+
+    # -- straight off the create event (denominated in SOL) --
+    curve_sol: float = 0.0            # vSolInBondingCurve
+    curve_tokens: float = 0.0         # vTokensInBondingCurve
+    market_cap_sol: float = 0.0
+    dev_initial_buy_sol: float = 0.0  # the deployer's own opening buy
+    uri: str = ""
+    pool: str = ""
+
+    # -- accumulated during the watch window --
+    unique_traders: int = 0
+    observed_seconds: float = 0.0
+    volume_sol: float = 0.0
+    price_change_pct: float = 0.0
+    dev_sold: bool = False
+
     raw: dict[str, Any] = Field(default_factory=dict)
     seen_at: datetime = Field(default_factory=_utcnow)
 
@@ -51,6 +72,24 @@ class Token(BaseModel):
         if self.sells <= 0:
             return float(self.buys) if self.buys else 0.0
         return self.buys / self.sells
+
+    @property
+    def trades(self) -> int:
+        return self.buys + self.sells
+
+    def priced(self, sol_usd: float) -> "Token":
+        """Return a copy with the SOL-denominated fields converted to USD.
+
+        The feed speaks SOL; every threshold in the config speaks USD.
+        """
+        if sol_usd <= 0:
+            return self
+        return self.model_copy(
+            update={
+                "liquidity_usd": self.curve_sol * sol_usd,
+                "market_cap_usd": self.market_cap_sol * sol_usd,
+            }
+        )
 
 
 class Stock(BaseModel):

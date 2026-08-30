@@ -69,7 +69,7 @@ async def test_out_of_range_fractions_are_replaced_with_defaults(client_factory)
 async def test_prompt_carries_the_position_state(client_factory):
     client = client_factory({"action": "HOLD"})
     await ExitManager(CONFIG, client=client).run(POSITION)
-    sent = client.calls[0]["json"]["messages"][0]["content"]
+    sent = client.calls[0]["json"]["messages"][1]["content"]
     assert "ACME" in sent and "pnl_pct" in sent and "hold_time_hours" in sent
 
 

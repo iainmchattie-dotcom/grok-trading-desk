@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..base_agent import GrokAgent, clamp01
+from ..base_agent import BOOL, TEXT, UNIT, GrokAgent, clamp01, schema
 from ..models import Token
 
 PROMPT = """You judge the meme potential of a newly launched Solana token.
@@ -30,10 +30,28 @@ class Narrative(GrokAgent):
     name = "narrative"
     model_tier = "fast"
     PROMPT = PROMPT
+    SCHEMA = schema(
+        {
+            "meme_score": UNIT,
+            "originality": UNIT,
+            "virality": UNIT,
+            "community_signal": UNIT,
+            "is_derivative": BOOL,
+            "theme": TEXT,
+            "reasoning": TEXT,
+        }
+    )
+    # Whether a meme is running *right now* is only answerable from X, and only
+    # from the last day or two.
+    SEARCH = {
+        "mode": "on",
+        "sources": [{"type": "x", "post_view_count": 1000}],
+        "max_search_results": 15,
+    }
 
-    def build_prompt(self, payload: Token | dict[str, Any]) -> str:
+    def facts(self, payload: Token | dict[str, Any]) -> dict[str, Any]:
         token = payload if isinstance(payload, Token) else Token(**payload)
-        facts = {
+        return {
             "symbol": token.symbol,
             "name": token.name,
             "socials": token.socials,
@@ -41,7 +59,6 @@ class Narrative(GrokAgent):
             "age_seconds": token.age_seconds,
             "market_cap_usd": token.market_cap_usd,
         }
-        return f"{self.PROMPT}\n\nTOKEN:\n{facts}"
 
     def postprocess(self, data: dict[str, Any]) -> dict[str, Any]:
         return {

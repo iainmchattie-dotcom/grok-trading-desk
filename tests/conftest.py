@@ -14,20 +14,38 @@ import pytest
 class FakeResponse:
     """Minimal stand-in for httpx.Response as base_agent uses it."""
 
-    def __init__(self, content: str, status_code: int = 200):
+    def __init__(
+        self,
+        content: str,
+        status_code: int = 200,
+        usage: dict[str, Any] | None = None,
+        citations: list[str] | None = None,
+        headers: dict[str, str] | None = None,
+    ):
         self._content = content
         self.status_code = status_code
+        self.usage = usage
+        self.citations = citations
+        self.headers = headers or {}
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise httpx.HTTPStatusError(
+            error = httpx.HTTPStatusError(
                 f"status {self.status_code}",
                 request=httpx.Request("POST", "https://api.x.ai/v1/chat/completions"),
                 response=None,  # type: ignore[arg-type]
             )
+            # base_agent reads exc.response.status_code to decide retryability
+            error.response = self  # type: ignore[assignment]
+            raise error
 
     def json(self) -> dict[str, Any]:
-        return {"choices": [{"message": {"content": self._content}}]}
+        body: dict[str, Any] = {"choices": [{"message": {"content": self._content}}]}
+        if self.usage is not None:
+            body["usage"] = self.usage
+        if self.citations is not None:
+            body["citations"] = self.citations
+        return body
 
 
 class FakeClient:
@@ -42,7 +60,10 @@ class FakeClient:
         reply = self.replies[min(len(self.calls) - 1, len(self.replies) - 1)]
         if isinstance(reply, Exception):
             raise reply
-        if isinstance(reply, FakeResponse):
+        # Duck-typed on purpose: pytest imports this file as `conftest` while
+        # the test modules import it as `tests.conftest`, so isinstance against
+        # FakeResponse compares two different class objects and always fails.
+        if hasattr(reply, "raise_for_status"):
             return reply
         if isinstance(reply, (dict, list)):
             return FakeResponse(_json.dumps(reply))
@@ -75,8 +96,10 @@ CONFIG: dict[str, Any] = {
     "grok": {
         "api_key": "test-key",
         "base_url": "https://api.x.ai/v1/chat/completions",
-        "fast_model": "grok-4-fast",
-        "full_model": "grok-4",
+        "models": {"fast": "grok-4.3", "deep": "grok-4.6"},
+        "reasoning_effort": {"fast": "none"},
+        "structured_outputs": True,
+        "live_search": True,
         "timeout_seconds": 5,
         "max_retries": 3,
     },

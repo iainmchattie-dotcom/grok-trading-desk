@@ -7,9 +7,10 @@ would burn dozens of calls a day for the same answer.
 from __future__ import annotations
 
 import time
+from datetime import date, timedelta
 from typing import Any
 
-from ..base_agent import GrokAgent, clamp01
+from ..base_agent import TEXT, UNIT, GrokAgent, clamp01, enum, schema
 
 PROMPT = """You assess the current risk regime of the Solana memecoin market.
 
@@ -29,6 +30,21 @@ class CryptoPulse(GrokAgent):
     name = "crypto_pulse"
     model_tier = "fast"
     PROMPT = PROMPT
+    SCHEMA = schema(
+        {
+            "regime": enum("risk_on", "neutral", "risk_off"),
+            "go_signal": UNIT,
+            "risk_appetite": UNIT,
+            "sol_trend": enum("up", "flat", "down"),
+            "notes": TEXT,
+        }
+    )
+    # A regime read without today's data is just a guess about February.
+    SEARCH = {
+        "mode": "on",
+        "sources": [{"type": "x", "post_view_count": 2000}, {"type": "news"}, {"type": "web"}],
+        "max_search_results": 20,
+    }
 
     def __init__(self, config: dict[str, Any], client=None):
         super().__init__(config, client)
@@ -37,8 +53,15 @@ class CryptoPulse(GrokAgent):
         self._cache: dict[str, Any] | None = None
         self._cache_time: float = 0.0
 
-    def build_prompt(self, payload: Any = None) -> str:
-        return f"{self.PROMPT}\n\nCONTEXT:\n{payload or {}}"
+    def facts(self, payload: Any = None) -> Any:
+        return payload or {"question": "current Solana memecoin regime"}
+
+    def search_parameters(self) -> dict[str, Any] | None:
+        params = super().search_parameters()
+        if params is not None:
+            # Yesterday onward: a regime read must not average in last week.
+            params["from_date"] = (date.today() - timedelta(days=1)).isoformat()
+        return params
 
     def postprocess(self, data: dict[str, Any]) -> dict[str, Any]:
         regime = str(data.get("regime", "risk_off")).lower()

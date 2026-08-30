@@ -33,8 +33,9 @@ async def test_auditor_parses_clean_audit(client_factory):
     assert result["coordinated_buys"] is False
     assert result["red_flags"] == []
     # the fast model and temperature=0 are non-negotiable
-    assert client.calls[0]["json"]["model"] == "grok-4-fast"
-    assert client.calls[0]["json"]["temperature"] == 0
+    body = client.calls[0]["json"]
+    assert body["model"] == "grok-4.3"
+    assert body["temperature"] == 0
     assert client.calls[0]["headers"]["Authorization"] == "Bearer test-key"
 
 
@@ -99,11 +100,12 @@ async def test_narrative_parses_and_falls_back(client_factory, no_sleep):
     assert bad["is_derivative"] is True
 
 
-async def test_crypto_checker_uses_the_full_model(client_factory):
+async def test_crypto_checker_uses_the_deep_model(client_factory):
     client = client_factory({"approve": True, "confidence": 0.7, "adjusted_score": 0.66})
     result = await CryptoChecker(CONFIG, client=client).run({"symbol": "WIF2"})
     assert result["approve"] is True
-    assert client.calls[0]["json"]["model"] == "grok-4"
+    # the checker must not run the same model as the bots it is checking
+    assert client.calls[0]["json"]["model"] == "grok-4.6"
 
 
 async def test_crypto_checker_rejects_on_failure(client_factory, no_sleep):
