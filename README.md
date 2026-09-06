@@ -179,7 +179,7 @@ months-old prior. `grok.live_search: false` is the degrade path: skip tools,
 stay on chat/completions, accept the cutoff. Each agent declares its own
 policy:
 
-| bot | tools | window |
+| bot | tools | window (X only) |
 |---|---|---|
 | insider | `web_search` (sec.gov, secform4.com, openinsider.com) | 95 days |
 | analyst | `web_search` (SEC + financial press) | — |
@@ -188,6 +188,13 @@ policy:
 | crypto_pulse | `web_search` + `x_search` | 1 day |
 | market_pulse | `web_search` + `x_search` | 2 days |
 | allocator | none — both pulses are already in its payload | — |
+
+Date windows are **X-only on the wire**: `from_date` / `to_date` are documented
+`x_search` parameters. `web_search` has no date or recency filter, so web/news
+results are uncapped by date. `max_search_results` is likewise in-process only
+— Agent Tools list no result-count cap, so it is not sent. Old Live Search
+`post_view_count` floors are restored as system-prompt instructions (prefer
+posts above that view count); they are not a tool filter.
 
 Citations come back with every answer and are stored on the buy record.
 

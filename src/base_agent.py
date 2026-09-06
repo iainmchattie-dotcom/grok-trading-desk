@@ -154,11 +154,117 @@ def extract_citations(envelope: dict[str, Any]) -> list[str]:
     return found
 
 
+def x_engagement_floor(params: dict[str, Any] | None) -> int | None:
+    """Largest `post_view_count` declared on an X source, if any.
+
+    Agent Tools have no engagement filter; callers put this in the prompt.
+    """
+    floors: list[int] = []
+    for src in (params or {}).get("sources") or []:
+        if not isinstance(src, dict) or src.get("type") != "x":
+            continue
+        raw = src.get("post_view_count")
+        if raw in (None, ""):
+            continue
+        try:
+            floors.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return max(floors) if floors else None
+
+
+def engagement_floor_instruction(params: dict[str, Any] | None) -> str:
+    """System-prompt line that restores the old Live Search view floor."""
+    floor = x_engagement_floor(params)
+    if floor is None:
+        return ""
+    return (
+        f"When using X posts, prefer those with at least {floor} views. "
+        "Treat lower-engagement posts as noise."
+    )
+
+
+def _first_int(mapping: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        value = mapping.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _tool_invocation_count(usage: dict[str, Any], envelope: dict[str, Any] | None) -> int:
+    raw = usage.get("num_sources_used")
+    if raw not in (None, ""):
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            pass
+    tool_usage = usage.get("server_side_tool_usage")
+    if not isinstance(tool_usage, dict) and envelope:
+        tool_usage = envelope.get("server_side_tool_usage")
+    if not isinstance(tool_usage, dict):
+        return 0
+    total = 0
+    for value in tool_usage.values():
+        try:
+            total += int(value or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def normalize_usage(
+    usage: dict[str, Any] | None,
+    envelope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fold chat/completions and Responses usage into one CostTracker shape.
+
+    Chat completions uses `prompt_tokens` / `completion_tokens`. Responses
+    typically uses `input_tokens` / `output_tokens`, sometimes with
+    `server_side_tool_usage` instead of `num_sources_used`.
+    """
+    usage = usage or {}
+    prompt_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+    completion_details = (
+        usage.get("completion_tokens_details") or usage.get("output_tokens_details") or {}
+    )
+    if not isinstance(prompt_details, dict):
+        prompt_details = {}
+    if not isinstance(completion_details, dict):
+        completion_details = {}
+    cached = _first_int(prompt_details, "cached_tokens") or _first_int(usage, "cached_tokens")
+    reasoning = _first_int(completion_details, "reasoning_tokens") or _first_int(
+        usage, "reasoning_tokens"
+    )
+    ticks = usage.get("cost_in_usd_ticks")
+    if ticks in (None, "") and envelope:
+        ticks = envelope.get("cost_in_usd_ticks")
+    return {
+        "prompt_tokens": _first_int(usage, "prompt_tokens", "input_tokens"),
+        "completion_tokens": _first_int(usage, "completion_tokens", "output_tokens"),
+        "num_sources_used": _tool_invocation_count(usage, envelope),
+        "cost_in_usd_ticks": ticks,
+        "prompt_tokens_details": {"cached_tokens": cached},
+        "completion_tokens_details": {"reasoning_tokens": reasoning},
+    }
+
+
 def search_tools_from_policy(params: dict[str, Any] | None) -> list[dict[str, Any]] | None:
     """Translate a Live Search policy dict into Agent Tools.
 
-    `news` has no dedicated tool; it is folded into `web_search`. Engagement
-    floors (`post_view_count`) are not accepted by `x_search` and are dropped.
+    Documented tool fields only — unknown keys 400 the request:
+
+    * `news` has no dedicated tool; it is folded into `web_search`.
+    * `max_search_results` is **not** a `web_search` / `x_search` parameter
+      (xAI SDK + docs list no result-count cap). Kept in-process only.
+    * `post_view_count` is **not** an `x_search` parameter. Restored as a
+      system-prompt instruction via `engagement_floor_instruction`.
+    * `from_date` / `to_date` are documented on `x_search` only. `web_search`
+      has no date/recency filter, so web/news stay uncapped by date.
     """
     if not params:
         return None
@@ -221,7 +327,8 @@ class CostTracker:
     """Running spend, straight from what the API billed us.
 
     `cost_in_usd_ticks` is exact, so there is no reason to estimate from token
-    counts and a price table that goes stale.
+    counts and a price table that goes stale. `record` accepts both
+    chat/completions and Responses usage shapes.
     """
 
     calls: int = 0
@@ -235,9 +342,24 @@ class CostTracker:
     cost_usd: float = 0.0
     by_agent: dict[str, float] = field(default_factory=dict)
 
-    def record(self, agent: str, usage: dict[str, Any] | None) -> None:
+    def record(
+        self,
+        agent: str,
+        usage: dict[str, Any] | None,
+        envelope: dict[str, Any] | None = None,
+    ) -> None:
         self.calls += 1
-        if not usage:
+        if not usage and not envelope:
+            return
+        usage = normalize_usage(usage, envelope)
+        if not any(
+            (
+                usage.get("prompt_tokens"),
+                usage.get("completion_tokens"),
+                usage.get("num_sources_used"),
+                usage.get("cost_in_usd_ticks"),
+            )
+        ):
             return
         self.prompt_tokens += int(usage.get("prompt_tokens", 0) or 0)
         self.completion_tokens += int(usage.get("completion_tokens", 0) or 0)
@@ -345,8 +467,13 @@ class GrokAgent:
         if recalled and isinstance(facts, dict):
             facts = {**facts, **recalled}
         rendered = json.dumps(facts, default=str, indent=None) if facts is not None else "{}"
+        system = self.PROMPT
+        # Static per agent (from SEARCH), so it stays in the cacheable prefix.
+        floor = engagement_floor_instruction(self.search_parameters())
+        if floor:
+            system = f"{system}\n\n{floor}" if system else floor
         return [
-            {"role": "system", "content": self.PROMPT},
+            {"role": "system", "content": system},
             {"role": "user", "content": rendered},
         ]
 
@@ -480,9 +607,9 @@ class GrokAgent:
                     envelope = await asyncio.wait_for(
                         self._post(client, body), timeout=timeout
                     )
-                    self.last_usage = envelope.get("usage") or {}
+                    self.last_usage = normalize_usage(envelope.get("usage"), envelope)
                     self.last_citations = extract_citations(envelope)
-                    self.costs.record(self.name, self.last_usage)
+                    self.costs.record(self.name, self.last_usage, envelope)
                     content = extract_message_content(envelope)
                     return self.postprocess(parse_json_response(content))
                 except Exception as exc:  # noqa: BLE001 - any failure means fallback

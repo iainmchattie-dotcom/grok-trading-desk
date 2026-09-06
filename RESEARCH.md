@@ -41,8 +41,24 @@ HTTP 410 with a body pointing at the Agent Tools API
 
 Replacement: `tools: [{type: web_search}, {type: x_search}]` on
 `/v1/responses`. `news` has no dedicated tool and is folded into `web_search`.
-`from_date` is a documented `x_search` parameter; `post_view_count` is not and
-must not be sent. Agents that need no retrieval stay on chat/completions.
+
+What the current Agent Tools docs / xAI Python SDK actually accept (verified
+2026-09-06 against `docs.x.ai/developers/tools/web-search`,
+`docs.x.ai/developers/tools/x-search`, and `xai_sdk.tools`):
+
+| want | on the wire? | why |
+|---|---|---|
+| `from_date` / `to_date` | **`x_search` only** | documented x_search params; `web_search` has none |
+| `max_search_results` | **no** | neither tool has a result-count / max-results field (`collections_search` has `limit`; web/x do not) |
+| `post_view_count` | **no** | not an `x_search` param; restored as a system-prompt engagement floor |
+| domain / handle lists | yes | `web_search.filters.allowed_domains`, `x_search.allowed_x_handles` |
+
+So date windows are X-only; web/news are uncapped by date. The result cap stays
+in the in-process `SEARCH` dict and is not sent (unknown tool fields 400).
+Engagement floors stay in `SEARCH` as `post_view_count` and are copied into the
+system prompt so the model still prefers higher-view posts.
+
+Agents that need no retrieval stay on chat/completions.
 
 Degrade path: `grok.live_search: false` omits tools, stays on chat/completions,
 and the model answers from the training cutoff. Pulse fallbacks remain
@@ -110,10 +126,14 @@ stay on chat/completions. `base_agent` derives `/v1/responses` from
 
 ### Cost and cache accounting
 
-`usage` carries `cost_in_usd_ticks` (exact; `TICKS_IN_USD_CENT = 100_000_000`,
-so USD = ticks / 1e10), `num_sources_used` (live-search billing unit),
-`prompt_tokens_details.cached_tokens` and
-`completion_tokens_details.reasoning_tokens`.
+Chat/completions `usage` carries `cost_in_usd_ticks` (exact;
+`TICKS_IN_USD_CENT = 100_000_000`, so USD = ticks / 1e10), `num_sources_used`,
+`prompt_tokens` / `completion_tokens`, `prompt_tokens_details.cached_tokens` and
+`completion_tokens_details.reasoning_tokens`. Responses uses `input_tokens` /
+`output_tokens` (and often `server_side_tool_usage` instead of
+`num_sources_used`). `normalize_usage` folds both shapes before
+`CostTracker.record` so retrieval agents on `/v1/responses` are not
+undercounted.
 
 `prompt_cache_key` gives sticky routing for cache hits. Prompts are now built
 static-prefix-first so the constant PROMPT block is cacheable, and every agent

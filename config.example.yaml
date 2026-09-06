@@ -22,6 +22,7 @@ grok:
   live_search: true
   # Optional override; derived from base_url when unset.
   # responses_url: "https://api.x.ai/v1/responses"
+  # In-process only. web_search / x_search have no result-count parameter.
   max_search_results: 15
   timeout_seconds: 30
   tool_timeout_seconds: 60    # Agent Tools run a server-side search loop

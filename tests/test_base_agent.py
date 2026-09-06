@@ -11,16 +11,20 @@ from src.base_agent import (
     GrokAgent,
     derive_responses_url,
     extract_message_content,
+    normalize_usage,
     parse_json_response,
     schema,
 )
 from src.crypto.auditor import Auditor
 from src.crypto.crypto_checker import CryptoChecker
 from src.crypto.crypto_pulse import CryptoPulse
+from src.crypto.narrative import Narrative
 from src.shared.allocator import Allocator
+from src.shared.exit_manager import ExitManager
 from src.stocks.insider import Insider
 from src.stocks.market_pulse import MarketPulse
 from src.stocks.radar import Radar
+from src.stocks.stock_checker import StockChecker
 
 
 class Probe(GrokAgent):
@@ -133,6 +137,50 @@ def test_x_source_becomes_x_search_tool():
     # post_view_count is not a tool parameter; do not send unknown fields
     x = next(t for t in tools if t["type"] == "x_search")
     assert "post_view_count" not in x
+
+
+def test_max_search_results_is_not_sent_on_tools():
+    # Agent Tools have no result-count parameter; the in-process cap stays local.
+    body = Radar(CONFIG).build_request({"symbol": "ACME"})
+    assert "max_search_results" not in body
+    for tool in body["tools"]:
+        assert "max_search_results" not in tool
+        assert "max_results" not in tool
+
+
+def test_web_search_has_no_date_window_on_the_wire():
+    body = CryptoPulse(CONFIG).build_request(None)
+    web = next(t for t in body["tools"] if t["type"] == "web_search")
+    assert "from_date" not in web and "to_date" not in web
+    x = next(t for t in body["tools"] if t["type"] == "x_search")
+    assert "from_date" in x
+
+
+def test_engagement_floor_is_restored_in_the_system_prompt():
+    cases = (
+        (CryptoPulse(CONFIG).build_request(None), 2000),
+        (MarketPulse(CONFIG).build_request(None), 5000),
+        (Narrative(CONFIG).build_request({"mint": "M", "symbol": "WIF2"}), 1000),
+        (Auditor(CONFIG).build_request({"mint": "M"}), 500),
+        (CryptoChecker(CONFIG).build_request({}), 500),
+        (Radar(CONFIG).build_request({"symbol": "ACME"}), 1000),
+        (ExitManager(CONFIG).build_request({
+            "market": "stocks", "symbol": "ACME", "quantity": 1, "entry_price": 10,
+        }), 1000),
+        (StockChecker(CONFIG).build_request({}), None),
+    )
+    for body, floor in cases:
+        system = (body.get("input") or body.get("messages"))[0]["content"]
+        if floor is None:
+            assert "views" not in system
+        else:
+            assert f"at least {floor} views" in system
+
+
+def test_engagement_floor_is_omitted_when_live_search_is_off():
+    config = {"grok": {**CONFIG["grok"], "live_search": False}}
+    body = Radar(config).build_request({"symbol": "A"})
+    assert "views" not in body["messages"][0]["content"]
 
 
 def test_pulse_agents_use_responses_and_date_window():
@@ -249,6 +297,15 @@ USAGE = {
     "completion_tokens_details": {"reasoning_tokens": 50},
 }
 
+RESPONSES_USAGE = {
+    "input_tokens": 1000,
+    "output_tokens": 200,
+    "cost_in_usd_ticks": 25_000_000_000,
+    "input_tokens_details": {"cached_tokens": 400},
+    "output_tokens_details": {"reasoning_tokens": 50},
+    "server_side_tool_usage": {"web_search": 4, "x_search": 8},
+}
+
 
 async def test_cost_is_taken_from_the_billed_amount(client_factory):
     costs = CostTracker()
@@ -286,6 +343,44 @@ async def test_usage_absent_does_not_break_accounting(client_factory):
     await Probe(CONFIG, client=client_factory('{"ok": true}'), costs=costs).run()
     assert costs.snapshot()["cost_usd"] == 0.0
     assert costs.calls == 1
+
+
+def test_normalize_usage_maps_responses_keys():
+    mapped = normalize_usage(RESPONSES_USAGE)
+    assert mapped["prompt_tokens"] == 1000
+    assert mapped["completion_tokens"] == 200
+    assert mapped["num_sources_used"] == 12
+    assert mapped["cost_in_usd_ticks"] == 25_000_000_000
+    assert mapped["prompt_tokens_details"]["cached_tokens"] == 400
+    assert mapped["completion_tokens_details"]["reasoning_tokens"] == 50
+
+
+def test_cost_tracker_accepts_responses_usage():
+    costs = CostTracker()
+    costs.record("crypto_pulse", RESPONSES_USAGE)
+    snap = costs.snapshot()
+    assert snap["prompt_tokens"] == 1000
+    assert snap["completion_tokens"] == 200
+    assert snap["cached_tokens"] == 400
+    assert snap["reasoning_tokens"] == 50
+    assert snap["sources_used"] == 12
+    assert snap["cost_usd"] == pytest.approx(2.5)
+    assert snap["by_agent"]["crypto_pulse"] == pytest.approx(2.5)
+
+
+async def test_run_records_responses_usage_from_the_envelope(client_factory):
+    costs = CostTracker()
+    envelope = {
+        "output_text": '{"ok": true}',
+        "usage": RESPONSES_USAGE,
+        "server_side_tool_usage": {"web_search": 3},
+    }
+    # usage.server_side_tool_usage wins over the envelope-level copy
+    await Probe(CONFIG, client=client_factory(FakeResponse("", envelope=envelope)), costs=costs).run()
+    snap = costs.snapshot()
+    assert snap["prompt_tokens"] == 1000
+    assert snap["sources_used"] == 12
+    assert snap["cost_usd"] == pytest.approx(2.5)
 
 
 async def test_citations_are_captured(client_factory):
