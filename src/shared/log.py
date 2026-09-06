@@ -50,6 +50,7 @@ class EventLog:
         all_agent_scores: dict[str, Any],
         amount: float,
         tx_id: str = "",
+        **extra: Any,
     ) -> dict[str, Any]:
         return self.write(
             "buy",
@@ -59,6 +60,7 @@ class EventLog:
             all_agent_scores=all_agent_scores,
             amount=amount,
             tx_id=tx_id,
+            **extra,
         )
 
     def skip(self, market: str, symbol: str, reason: str, detail: Any = None) -> dict[str, Any]:

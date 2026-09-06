@@ -29,7 +29,11 @@ solana:
     block_engine_url: "https://mainnet.block-engine.jito.wtf"
     tip_lamports: 100000
   priority_fee_microlamports: 200000
+  compute_unit_limit: 400000
   slippage_bps: 500
+  confirm_timeout_seconds: 30
+  dust_usd: 0.5
+  jupiter_base_url: "https://quote-api.jup.ag/v6"
 
 alpaca:
   api_key: "REPLACE_ME"
