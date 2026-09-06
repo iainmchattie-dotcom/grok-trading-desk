@@ -57,7 +57,7 @@ the upstream docs actually say and why several defaults here are what they are.
         │                     │                                       │
    ┌────▼──────────────┐ ┌────▼────────────────────────┐  ┌───────────▼────────┐
    │ crypto_executor   │ │ stock_executor              │  │  13 exit_manager   │
-   │ STUB (you wire it)│ │ Alpaca bracket orders       │  │  (fast) HOLD/      │
+   │ pump / Jupiter    │ │ Alpaca bracket orders       │  │  (fast) HOLD/      │
    └───────────────────┘ └─────────────────────────────┘  │  TIGHTEN/TRIM/CLOSE│
                                                           └────────────────────┘
         └──────────── shared/risk.py — one portfolio, both markets ──────────────┘
@@ -234,10 +234,15 @@ python -m src.desk --config config.yaml --i-understand-the-risk
 
 Either one alone leaves you on paper, and the desk logs a warning saying so.
 
-Crypto execution raises `NotImplementedError` by design — `crypto_executor.py`
-carries detailed notes on what to implement (Jito bundle path, bonding-curve vs.
-Raydium routing, decimals, confirmation deadlines), but the code that signs
-transactions with your keys is yours to write.
+Crypto execution follows the same paper/live gate. Paper never broadcasts: it
+quotes the bonding curve (or Jupiter once the curve is complete), records a
+local fill and returns a `PAPER-…` id. Live loads `solana.wallet_key` via
+solders, builds a pump.fun `buy_v2`/`sell_v2` or a Jupiter swap, attaches the
+configured compute-budget priority fee, and either submits a single-transaction
+Jito bundle (with tip) or sends through RPC with `skip_preflight=false`. A
+bundle or signature that does not confirm before `confirm_timeout_seconds`, or
+a wallet delta below the quoted minimum, is an `ExecutionFailed` — never a
+fill. `tighten_stop` is desk-side only; pump.fun has no on-chain stop.
 
 ---
 
@@ -308,6 +313,7 @@ One JSONL line per event, append-only, never rewritten. Five record types:
 | `close` | market, symbol, pnl, hold_time |
 | `action` | symbol, action (HOLD/TIGHTEN/TRIM/CLOSE), reason |
 | `allocation` | crypto_pct, stocks_pct, reason |
+| `stranded` | mint, side, signature, raw_amount — confirmed swap that did not fill in full |
 | `cost` | cumulative calls, spend, cache hit rate, sources, per-agent |
 
 Broker refusals get their own skip reasons rather than a generic failure:
@@ -330,6 +336,6 @@ that base rate.
 
 Nothing here is financial advice. It ships paper-first for a reason: run it on
 paper long enough to see how it actually behaves before you consider anything else.
-Understand every line before you point it at real money — especially the executor
-you have to write yourself. You are responsible for your own losses, and for
-whatever your jurisdiction has to say about automated trading.
+Understand every line before you point it at real money. You are responsible
+for your own losses, and for whatever your jurisdiction has to say about
+automated trading.

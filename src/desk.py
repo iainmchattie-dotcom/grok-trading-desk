@@ -24,7 +24,7 @@ import yaml
 from .base_agent import CostTracker
 from .crypto.auditor import Auditor
 from .crypto.crypto_checker import CryptoChecker
-from .crypto.crypto_executor import CryptoExecutor
+from .crypto.crypto_executor import CryptoExecutor, ExecutionFailed
 from .crypto.crypto_pulse import CryptoPulse
 from .crypto.crypto_scoring import score_token
 from .crypto.narrative import Narrative
@@ -82,7 +82,7 @@ class TradingDesk:
         self.narrative = agent(Narrative)
         self.crypto_pulse = agent(CryptoPulse)
         self.crypto_checker = agent(CryptoChecker)
-        self.crypto_executor = CryptoExecutor(config)
+        self.crypto_executor = CryptoExecutor(config, event_log=self.log, live_ack=live_ack)
 
         # stock side
         self.screener = Screener(config)
@@ -208,32 +208,76 @@ class TradingDesk:
 
             if self.dry_run:
                 self.log.buy(Market.CRYPTO.value, token.symbol or token.mint, verdict["score"],
-                             agent_scores, amount, tx_id="DRY_RUN")
+                             agent_scores, amount, tx_id="DRY_RUN", mint=token.mint)
                 return {"bought": True, "dry_run": True, "amount": amount}
 
             try:
                 fill = await self.crypto_executor.buy(token.mint, amount)
+            except ExecutionFailed as rejection:
+                stranded = getattr(rejection, "stranded", None) or {}
+                self.log.skip(
+                    Market.CRYPTO.value,
+                    token.symbol or token.mint,
+                    rejection.reason,
+                    {"detail": rejection.detail, "stranded": stranded},
+                )
+                # Fail-closed for sizing: SOL likely left the wallet. Surface
+                # any tokens that landed so they are not invisible orphans.
+                qty = float(stranded.get("quantity") or 0)
+                if qty > 0 and stranded.get("side") == "buy":
+                    self.risk.record_fill(Market.CRYPTO, amount)
+                    self.positions.append(
+                        Position(
+                            market=Market.CRYPTO,
+                            symbol=token.symbol or token.mint,
+                            quantity=qty,
+                            entry_price=amount / qty,
+                            current_price=amount / qty,
+                            amount_usd=amount,
+                            score=verdict["score"],
+                            meta={
+                                "mint": token.mint,
+                                "tx_id": stranded.get("signature", ""),
+                                "stranded": True,
+                                "raw_amount": stranded.get("raw_amount", 0),
+                            },
+                        )
+                    )
+                return {
+                    "bought": False,
+                    "reason": rejection.reason,
+                    "stranded": stranded,
+                }
             except NotImplementedError as exc:
-                # the stub is expected until the owner wires signing
                 self.log.skip(Market.CRYPTO.value, token.symbol or token.mint,
                               "executor_not_implemented", str(exc))
                 return {"bought": False, "reason": "executor_not_implemented"}
 
-            self.risk.record_fill(Market.CRYPTO, amount)
+            quantity = float(fill.get("quantity", 0) or 0)
+            price = float(fill.get("price", 0) or 0)
+            tx_id = str(fill.get("tx_id", "") or "")
+            if quantity <= 0 or not tx_id:
+                self.log.skip(Market.CRYPTO.value, token.symbol or token.mint,
+                              "fill_unconfirmed_or_empty", fill)
+                return {"bought": False, "reason": "fill_unconfirmed_or_empty"}
+
+            deployed = float(fill.get("amount_usd", amount) or amount)
+            self.risk.record_fill(Market.CRYPTO, deployed)
             self.positions.append(
                 Position(
                     market=Market.CRYPTO,
                     symbol=token.symbol or token.mint,
-                    quantity=float(fill.get("quantity", 0)),
-                    entry_price=float(fill.get("price", 0)),
-                    amount_usd=amount,
+                    quantity=quantity,
+                    entry_price=price,
+                    current_price=price,
+                    amount_usd=deployed,
                     score=verdict["score"],
-                    meta={"mint": token.mint, "tx_id": fill.get("tx_id", "")},
+                    meta={"mint": token.mint, "tx_id": tx_id, "venue": fill.get("venue", "")},
                 )
             )
             self.log.buy(Market.CRYPTO.value, token.symbol or token.mint, verdict["score"],
-                         agent_scores, amount, tx_id=str(fill.get("tx_id", "")))
-            return {"bought": True, "amount": amount, "tx_id": fill.get("tx_id", "")}
+                         agent_scores, deployed, tx_id=tx_id, mint=token.mint)
+            return {"bought": True, "amount": deployed, "tx_id": tx_id}
 
     async def crypto_loop(self) -> None:
         log.info("crypto loop: streaming pump.fun")
@@ -375,24 +419,66 @@ class TradingDesk:
     # -- exit loop --------------------------------------------------------------------
 
     async def refresh_positions(self) -> list[Position]:
-        """Merge broker truth into our view. Crypto stays desk-side while the
-        executor is a stub."""
+        """Merge broker / wallet truth into our view.
+
+        A refresh failure must not clear the book. Desk-side crypto positions
+        are kept even when the wallet snapshot is empty (paper book, RPC
+        hiccup) and updated in place when a mint matches.
+        """
         try:
             live_stocks = await self.stock_executor.get_positions()
         except Exception as exc:  # noqa: BLE001 - a broker hiccup must not clear the book
             log.warning("could not refresh stock positions: %s", exc)
-            return self.positions
+            live_stocks = None
 
-        by_symbol = {p.symbol: p for p in self.positions if p.market == Market.STOCKS}
-        merged: list[Position] = [p for p in self.positions if p.market == Market.CRYPTO]
-        for live in live_stocks:
-            known = by_symbol.get(live.symbol)
-            if known is not None:
-                known.quantity = live.quantity
-                known.current_price = live.current_price
-                merged.append(known)
-            else:
-                merged.append(live)
+        try:
+            live_crypto = await self.crypto_executor.get_positions()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not refresh crypto positions: %s", exc)
+            live_crypto = None
+
+        merged: list[Position] = []
+
+        stock_known = {p.symbol: p for p in self.positions if p.market == Market.STOCKS}
+        if live_stocks is None:
+            merged.extend(p for p in self.positions if p.market == Market.STOCKS)
+        else:
+            for live in live_stocks:
+                known = stock_known.get(live.symbol)
+                if known is not None:
+                    known.quantity = live.quantity
+                    known.current_price = live.current_price
+                    merged.append(known)
+                else:
+                    merged.append(live)
+
+        crypto_known = {
+            str((p.meta or {}).get("mint") or p.symbol): p
+            for p in self.positions
+            if p.market == Market.CRYPTO
+        }
+        if live_crypto is None:
+            merged.extend(p for p in self.positions if p.market == Market.CRYPTO)
+        else:
+            seen: set[str] = set()
+            for live in live_crypto:
+                key = str((live.meta or {}).get("mint") or live.symbol)
+                seen.add(key)
+                known = crypto_known.get(key)
+                if known is not None:
+                    known.quantity = live.quantity
+                    known.current_price = live.current_price
+                    if live.stop_price:
+                        known.stop_price = live.stop_price
+                    merged.append(known)
+                else:
+                    merged.append(live)
+            # Keep desk-only lots the wallet snapshot did not mention. Dropping
+            # them on an empty paper book would hide an open risk.
+            for key, known in crypto_known.items():
+                if key not in seen:
+                    merged.append(known)
+
         self.positions = merged
         return self.positions
 
@@ -434,14 +520,19 @@ class TradingDesk:
                 )
                 await executor.close_position(target)
                 self.risk.record_close(position.market, position.pnl_usd, position.amount_usd)
-                self.log.close(position.market.value, position.symbol,
-                               round(position.pnl_usd, 2), round(position.hold_time_hours, 2))
+                self.log.close(
+                    position.market.value,
+                    position.symbol,
+                    round(position.pnl_usd, 2),
+                    round(position.hold_time_hours, 2),
+                    mint=(position.meta or {}).get("mint", ""),
+                )
                 self.positions = [p for p in self.positions if p is not position]
 
         except NotImplementedError as exc:
             self.log.skip(position.market.value, position.symbol,
                           "executor_not_implemented", str(exc))
-        except OrderRejected as rejection:
+        except (OrderRejected, ExecutionFailed) as rejection:
             self.log.skip(position.market.value, position.symbol,
                           rejection.reason, rejection.detail)
         except Exception as exc:  # noqa: BLE001
@@ -519,20 +610,26 @@ class TradingDesk:
 
     async def run(self) -> None:
         log.info(
-            "desk starting — dry_run=%s, stock execution=%s, models=%s/%s, live_search=%s",
+            "desk starting — dry_run=%s, stock=%s, crypto=%s, models=%s/%s, live_search=%s",
             self.dry_run,
             "paper" if self.stock_executor.paper else "LIVE",
+            "paper" if self.crypto_executor.paper else "LIVE",
             self.analyst.model,
             self.stock_checker.model,
             self.analyst.live_search,
         )
         log.info("outcome memory: %d closed trades loaded", self.refresh_memory())
-        await asyncio.gather(
-            self.crypto_loop(),
-            self.stock_loop(),
-            self.exit_loop(),
-            self.allocator_loop(),
-        )
+        try:
+            await asyncio.gather(
+                self.crypto_loop(),
+                self.stock_loop(),
+                self.exit_loop(),
+                self.allocator_loop(),
+            )
+        finally:
+            closer = getattr(self.crypto_executor, "aclose", None)
+            if closer is not None:
+                await closer()
 
 
 def main() -> None:

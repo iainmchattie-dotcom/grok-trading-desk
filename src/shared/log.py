@@ -50,6 +50,7 @@ class EventLog:
         all_agent_scores: dict[str, Any],
         amount: float,
         tx_id: str = "",
+        **extra: Any,
     ) -> dict[str, Any]:
         return self.write(
             "buy",
@@ -59,6 +60,7 @@ class EventLog:
             all_agent_scores=all_agent_scores,
             amount=amount,
             tx_id=tx_id,
+            **extra,
         )
 
     def skip(self, market: str, symbol: str, reason: str, detail: Any = None) -> dict[str, Any]:
@@ -77,6 +79,26 @@ class EventLog:
     def allocation(self, crypto_pct: float, stocks_pct: float, reason: str) -> dict[str, Any]:
         return self.write(
             "allocation", crypto_pct=crypto_pct, stocks_pct=stocks_pct, reason=reason
+        )
+
+    def stranded(
+        self,
+        market: str,
+        mint: str,
+        side: str,
+        signature: str,
+        raw_amount: int,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """A confirmed tx that did not fill in full. Inventory must stay visible."""
+        return self.write(
+            "stranded",
+            market=market,
+            mint=mint,
+            side=side,
+            signature=signature,
+            raw_amount=raw_amount,
+            **extra,
         )
 
     # -- reading back ----------------------------------------------------------------

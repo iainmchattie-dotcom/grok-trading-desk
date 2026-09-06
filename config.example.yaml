@@ -29,7 +29,16 @@ solana:
     block_engine_url: "https://mainnet.block-engine.jito.wtf"
     tip_lamports: 100000
   priority_fee_microlamports: 200000
+  compute_unit_limit: 400000
   slippage_bps: 500
+  confirm_timeout_seconds: 30
+  dust_usd: 0.5
+  jupiter_base_url: "https://quote-api.jup.ag/v6"
+  # Optional overrides. When unset, fee recipients rotate by mint hash so
+  # we do not hotspot PUMP_FEE_RECIPIENTS[0]. Mayhem coins use the reserved list.
+  pump:
+    fee_recipient: ""
+    buyback_fee_recipient: ""
 
 alpaca:
   api_key: "REPLACE_ME"
