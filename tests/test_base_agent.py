@@ -4,12 +4,27 @@ import httpx
 import pytest
 
 from tests.conftest import CONFIG, FakeResponse
-from src.base_agent import CostTracker, GrokAgent, parse_json_response, schema
+from datetime import date, timedelta
+
+from src.base_agent import (
+    CostTracker,
+    GrokAgent,
+    derive_responses_url,
+    extract_message_content,
+    normalize_usage,
+    parse_json_response,
+    schema,
+)
 from src.crypto.auditor import Auditor
 from src.crypto.crypto_checker import CryptoChecker
+from src.crypto.crypto_pulse import CryptoPulse
+from src.crypto.narrative import Narrative
 from src.shared.allocator import Allocator
+from src.shared.exit_manager import ExitManager
 from src.stocks.insider import Insider
+from src.stocks.market_pulse import MarketPulse
 from src.stocks.radar import Radar
+from src.stocks.stock_checker import StockChecker
 
 
 class Probe(GrokAgent):
@@ -76,36 +91,172 @@ def test_model_defaults_split_the_tiers():
     assert CryptoChecker({}).model == "grok-4.6"
 
 
-# --- live search -------------------------------------------------------------------
+# --- Agent Tools (Live Search was retired; search_parameters is HTTP 410) ----------
 
-def test_search_parameters_are_sent_when_an_agent_declares_them():
-    body = Radar(CONFIG).build_request({"symbol": "ACME"})
-    search = body["search_parameters"]
-    assert search["mode"] == "on"
-    assert {s["type"] for s in search["sources"]} == {"news", "x", "web"}
-    assert "from_date" in search       # radar's prompt asks for two weeks
+def test_retrieval_agents_send_tools_not_search_parameters():
+    radar = Radar(CONFIG)
+    body = radar.build_request({"symbol": "ACME"})
+    assert "search_parameters" not in body
+    assert {t["type"] for t in body["tools"]} == {"web_search", "x_search"}
+    assert body["input"][0]["role"] == "system"
+    assert "messages" not in body
+    x = next(t for t in body["tools"] if t["type"] == "x_search")
+    assert x["from_date"] == (date.today() - timedelta(days=14)).isoformat()
+    assert radar.request_url(body).endswith("/responses")
 
 
 def test_insider_whitelists_primary_filing_sources():
-    search = Insider(CONFIG).build_request({"symbol": "ACME"})["search_parameters"]
-    web = next(s for s in search["sources"] if s["type"] == "web")
-    assert "sec.gov" in web["allowed_websites"]
-    assert len(web["allowed_websites"]) <= 5   # API caps the whitelist at 5
+    body = Insider(CONFIG).build_request({"symbol": "ACME"})
+    assert "search_parameters" not in body
+    web = next(t for t in body["tools"] if t["type"] == "web_search")
+    assert "sec.gov" in web["filters"]["allowed_domains"]
+    assert len(web["filters"]["allowed_domains"]) <= 5   # API caps the whitelist at 5
 
 
-def test_agents_that_need_no_retrieval_send_none():
-    assert "search_parameters" not in Allocator(CONFIG).build_request({})
+def test_responses_bodies_use_text_format_not_response_format():
+    # Live 400: response_format exists on chat/completions only.
+    cases = (
+        (CryptoPulse(CONFIG), None),
+        (MarketPulse(CONFIG), None),
+        (Radar(CONFIG), {"symbol": "ACME"}),
+        (Auditor(CONFIG), {"mint": "M"}),
+    )
+    for agent, payload in cases:
+        body = agent.build_request(payload)
+        assert body.get("tools")
+        assert agent.request_url(body).endswith("/responses")
+        assert "response_format" not in body
+        fmt = body["text"]["format"]
+        assert fmt["type"] == "json_schema"
+        assert fmt["name"] == agent.name
+        assert fmt["strict"] is True
+        assert fmt["schema"] == agent.SCHEMA
+        assert "json_schema" not in fmt
+
+
+def test_responses_json_object_when_structured_outputs_is_off():
+    config = {"grok": {**CONFIG["grok"], "structured_outputs": False}}
+    body = CryptoPulse(config).build_request(None)
+    assert "response_format" not in body
+    assert body["text"]["format"] == {"type": "json_object"}
+
+
+def test_allocator_keeps_response_format_on_chat_completions():
+    body = Allocator(CONFIG).build_request({})
+    assert "tools" not in body
+    assert "text" not in body
+    assert body["response_format"]["type"] == "json_schema"
+    assert Allocator(CONFIG).request_url(body).endswith("/chat/completions")
+
+
+def test_agents_that_need_no_retrieval_stay_on_chat_completions():
+    alloc = Allocator(CONFIG)
+    body = alloc.build_request({})
+    assert "search_parameters" not in body
+    assert "tools" not in body
+    assert "messages" in body
+    assert alloc.request_url(body).endswith("/chat/completions")
 
 
 def test_live_search_can_be_switched_off_globally():
     config = {"grok": {**CONFIG["grok"], "live_search": False}}
-    assert "search_parameters" not in Radar(config).build_request({"symbol": "A"})
+    radar = Radar(config)
+    body = radar.build_request({"symbol": "A"})
+    assert "search_parameters" not in body
+    assert "tools" not in body
+    assert radar.request_url(body).endswith("/chat/completions")
 
 
-def test_x_source_carries_an_engagement_floor():
-    search = Auditor(CONFIG).build_request({"mint": "M"})["search_parameters"]
-    x = next(s for s in search["sources"] if s["type"] == "x")
-    assert x["post_view_count"] > 0
+def test_x_source_becomes_x_search_tool():
+    tools = Auditor(CONFIG).build_request({"mint": "M"})["tools"]
+    assert any(t["type"] == "x_search" for t in tools)
+    # post_view_count is not a tool parameter; do not send unknown fields
+    x = next(t for t in tools if t["type"] == "x_search")
+    assert "post_view_count" not in x
+
+
+def test_max_search_results_is_not_sent_on_tools():
+    # Agent Tools have no result-count parameter; the in-process cap stays local.
+    body = Radar(CONFIG).build_request({"symbol": "ACME"})
+    assert "max_search_results" not in body
+    for tool in body["tools"]:
+        assert "max_search_results" not in tool
+        assert "max_results" not in tool
+
+
+def test_web_search_has_no_date_window_on_the_wire():
+    body = CryptoPulse(CONFIG).build_request(None)
+    web = next(t for t in body["tools"] if t["type"] == "web_search")
+    assert "from_date" not in web and "to_date" not in web
+    x = next(t for t in body["tools"] if t["type"] == "x_search")
+    assert "from_date" in x
+
+
+def test_engagement_floor_is_restored_in_the_system_prompt():
+    cases = (
+        (CryptoPulse(CONFIG).build_request(None), 2000),
+        (MarketPulse(CONFIG).build_request(None), 5000),
+        (Narrative(CONFIG).build_request({"mint": "M", "symbol": "WIF2"}), 1000),
+        (Auditor(CONFIG).build_request({"mint": "M"}), 500),
+        (CryptoChecker(CONFIG).build_request({}), 500),
+        (Radar(CONFIG).build_request({"symbol": "ACME"}), 1000),
+        (ExitManager(CONFIG).build_request({
+            "market": "stocks", "symbol": "ACME", "quantity": 1, "entry_price": 10,
+        }), 1000),
+        (StockChecker(CONFIG).build_request({}), None),
+    )
+    for body, floor in cases:
+        system = (body.get("input") or body.get("messages"))[0]["content"]
+        if floor is None:
+            assert "views" not in system
+        else:
+            assert f"at least {floor} views" in system
+
+
+def test_engagement_floor_is_omitted_when_live_search_is_off():
+    config = {"grok": {**CONFIG["grok"], "live_search": False}}
+    body = Radar(config).build_request({"symbol": "A"})
+    assert "views" not in body["messages"][0]["content"]
+
+
+def test_pulse_agents_use_responses_and_date_window():
+    crypto = CryptoPulse(CONFIG)
+    crypto_body = crypto.build_request(None)
+    assert "search_parameters" not in crypto_body
+    assert {t["type"] for t in crypto_body["tools"]} == {"web_search", "x_search"}
+    crypto_x = next(t for t in crypto_body["tools"] if t["type"] == "x_search")
+    assert crypto_x["from_date"] == (date.today() - timedelta(days=1)).isoformat()
+    assert crypto.request_url(crypto_body) == "https://api.x.ai/v1/responses"
+
+    market = MarketPulse(CONFIG)
+    market_body = market.build_request(None)
+    assert "search_parameters" not in market_body
+    market_x = next(t for t in market_body["tools"] if t["type"] == "x_search")
+    assert market_x["from_date"] == (date.today() - timedelta(days=2)).isoformat()
+    assert market.request_url(market_body).endswith("/responses")
+
+
+def test_derive_responses_url_from_chat_completions():
+    assert derive_responses_url("https://api.x.ai/v1/chat/completions") == (
+        "https://api.x.ai/v1/responses"
+    )
+    assert derive_responses_url("https://api.x.ai/v1") == "https://api.x.ai/v1/responses"
+    assert derive_responses_url("https://api.x.ai/v1/responses") == (
+        "https://api.x.ai/v1/responses"
+    )
+
+
+def test_extract_message_content_reads_both_envelopes():
+    chat = {"choices": [{"message": {"content": '{"ok": true}'}}]}
+    assert extract_message_content(chat) == '{"ok": true}'
+    responses = {
+        "output": [
+            {"type": "web_search_call"},
+            {"type": "message", "content": [{"type": "output_text", "text": '{"ok": true}'}]},
+        ]
+    }
+    assert extract_message_content(responses) == '{"ok": true}'
+    assert extract_message_content({"output_text": '{"ok": true}'}) == '{"ok": true}'
 
 
 # --- retry policy ---------------------------------------------------------------------
@@ -115,6 +266,18 @@ async def test_a_400_is_not_retried(client_factory, no_sleep):
     result = await Probe(CONFIG, client=client).run()
     assert result["why"] == "fallback"
     assert len(client.calls) == 1     # our bug; repeating it three times is waste
+
+
+async def test_a_410_is_not_retried_and_pulse_stays_shut(client_factory, no_sleep):
+    client = client_factory(FakeResponse("", 410))
+    result = await CryptoPulse(CONFIG, client=client).run()
+    assert result["go_signal"] == 0.0
+    assert result["regime"] == "risk_off"
+    assert result["notes"] == "crypto_pulse_unavailable"
+    assert len(client.calls) == 1
+    # the retired Live Search field must not be on the wire
+    assert "search_parameters" not in client.calls[0]["json"]
+    assert client.calls[0]["url"].endswith("/responses")
 
 
 async def test_a_429_is_retried(client_factory, no_sleep):
@@ -170,6 +333,15 @@ USAGE = {
     "completion_tokens_details": {"reasoning_tokens": 50},
 }
 
+RESPONSES_USAGE = {
+    "input_tokens": 1000,
+    "output_tokens": 200,
+    "cost_in_usd_ticks": 25_000_000_000,
+    "input_tokens_details": {"cached_tokens": 400},
+    "output_tokens_details": {"reasoning_tokens": 50},
+    "server_side_tool_usage": {"web_search": 4, "x_search": 8},
+}
+
 
 async def test_cost_is_taken_from_the_billed_amount(client_factory):
     costs = CostTracker()
@@ -209,12 +381,75 @@ async def test_usage_absent_does_not_break_accounting(client_factory):
     assert costs.calls == 1
 
 
+def test_normalize_usage_maps_responses_keys():
+    mapped = normalize_usage(RESPONSES_USAGE)
+    assert mapped["prompt_tokens"] == 1000
+    assert mapped["completion_tokens"] == 200
+    assert mapped["num_sources_used"] == 12
+    assert mapped["cost_in_usd_ticks"] == 25_000_000_000
+    assert mapped["prompt_tokens_details"]["cached_tokens"] == 400
+    assert mapped["completion_tokens_details"]["reasoning_tokens"] == 50
+
+
+def test_cost_tracker_accepts_responses_usage():
+    costs = CostTracker()
+    costs.record("crypto_pulse", RESPONSES_USAGE)
+    snap = costs.snapshot()
+    assert snap["prompt_tokens"] == 1000
+    assert snap["completion_tokens"] == 200
+    assert snap["cached_tokens"] == 400
+    assert snap["reasoning_tokens"] == 50
+    assert snap["sources_used"] == 12
+    assert snap["cost_usd"] == pytest.approx(2.5)
+    assert snap["by_agent"]["crypto_pulse"] == pytest.approx(2.5)
+
+
+async def test_run_records_responses_usage_from_the_envelope(client_factory):
+    costs = CostTracker()
+    envelope = {
+        "output_text": '{"ok": true}',
+        "usage": RESPONSES_USAGE,
+        "server_side_tool_usage": {"web_search": 3},
+    }
+    # usage.server_side_tool_usage wins over the envelope-level copy
+    await Probe(CONFIG, client=client_factory(FakeResponse("", envelope=envelope)), costs=costs).run()
+    snap = costs.snapshot()
+    assert snap["prompt_tokens"] == 1000
+    assert snap["sources_used"] == 12
+    assert snap["cost_usd"] == pytest.approx(2.5)
+
+
 async def test_citations_are_captured(client_factory):
     agent = Probe(CONFIG, client=client_factory(
         FakeResponse('{"ok": true}', citations=["https://sec.gov/x", "https://x.com/y"])
     ))
     await agent.run()
     assert agent.last_citations == ["https://sec.gov/x", "https://x.com/y"]
+
+
+async def test_run_parses_a_responses_envelope(client_factory):
+    envelope = {
+        "output": [
+            {"type": "web_search_call"},
+            {
+                "type": "message",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": '{"regime": "neutral", "go_signal": 0.4, "risk_appetite": 0.3}',
+                        "annotations": [{"url": "https://example.com/sol"}],
+                    }
+                ],
+            },
+        ],
+        "usage": USAGE,
+    }
+    pulse = CryptoPulse(CONFIG, client=client_factory(FakeResponse("", envelope=envelope)))
+    result = await pulse.run()
+    assert result["regime"] == "neutral"
+    assert result["go_signal"] == 0.4
+    assert pulse.last_citations == ["https://example.com/sol"]
+    assert pulse.costs.snapshot()["cost_usd"] == pytest.approx(2.5)
 
 
 # --- parsing still guards the json_object path ----------------------------------------

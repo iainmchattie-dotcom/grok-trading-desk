@@ -1,17 +1,19 @@
 """Base class for every LLM-backed bot.
 
-Wraps one xAI chat completion: strict structured output, live search, retry
+Wraps one xAI call: strict structured output, Agent Tools retrieval, retry
 policy, cost accounting, and — most importantly — the pessimistic fallback. Every
 subclass declares what "we could not get an answer" means for it; the desk never
 sees a raised exception from an agent.
 
-Three things here come straight from the OpenAPI spec (see RESEARCH.md):
+Three things here come straight from the upstream docs (see RESEARCH.md):
 
-* `response_format: json_schema` with `strict: true` makes the model return the
-  shape we asked for, so parsing is no longer the weak link.
-* `search_parameters` is what gives an agent real data. Without it the docs are
-  explicit that "no data will be acquired by the model" — the model answers from
-  a training cutoff months in the past.
+* Structured outputs: chat/completions uses `response_format` (`json_schema`,
+  `strict: true`). `/v1/responses` rejects that field (HTTP 400) and wants
+  `text.format` instead — same schema, flattened `{type, name, schema, strict}`.
+* Live Search (`search_parameters` on `/v1/chat/completions`) was retired and
+  now returns HTTP 410 Gone. Agents that need current data send `web_search` /
+  `x_search` tools on `/v1/responses` instead. `grok.live_search: false` skips
+  retrieval and answers from the training cutoff.
 * `reasoning_effort` is only supported by grok-4.3, so it is attached by model
   slug rather than sent blindly.
 """
@@ -36,8 +38,10 @@ _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 TICKS_PER_USD = 10_000_000_000
 
 #: Only these deserve another attempt. A 400/422 is a bug in our request and
-#: will fail identically three times in a row.
+#: will fail identically three times in a row. 410 means the feature is gone.
 RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 
 
 def parse_json_response(text: str) -> dict[str, Any]:
@@ -69,12 +73,263 @@ def parse_json_response(text: str) -> dict[str, Any]:
     return parsed
 
 
+def derive_responses_url(chat_url: str) -> str:
+    """Map a chat/completions URL to the Responses API sibling.
+
+    Agent Tools (`web_search`, `x_search`) are served on `/v1/responses`.
+    Allocators and other no-retrieval agents stay on chat/completions.
+    """
+    url = (chat_url or "").rstrip("/")
+    if url.endswith(_CHAT_COMPLETIONS_SUFFIX):
+        return url[: -len(_CHAT_COMPLETIONS_SUFFIX)] + "/responses"
+    if url.endswith("/responses"):
+        return url
+    if url.endswith("/v1"):
+        return f"{url}/responses"
+    return f"{url}/responses" if url else "https://api.x.ai/v1/responses"
+
+
+def _text_from_content(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content") or ""
+                if text:
+                    parts.append(str(text))
+        return "".join(parts)
+    return str(content)
+
+
+def extract_message_content(envelope: dict[str, Any]) -> str:
+    """Pull the model text out of a chat/completions or Responses envelope."""
+    choices = envelope.get("choices")
+    if isinstance(choices, list) and choices:
+        message = (choices[0] or {}).get("message") or {}
+        text = _text_from_content(message.get("content"))
+        if text:
+            return text
+
+    output_text = envelope.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    texts: list[str] = []
+    for item in envelope.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in {None, "message", "output_text"}:
+            text = _text_from_content(item.get("content") or item.get("text"))
+            if text:
+                texts.append(text)
+    if texts:
+        return "".join(texts)
+    raise ValueError("no message content in response")
+
+
+def extract_citations(envelope: dict[str, Any]) -> list[str]:
+    """Citations from either API shape (top-level list or output annotations)."""
+    raw = envelope.get("citations")
+    if isinstance(raw, list) and raw:
+        return [str(item) for item in raw if item]
+
+    found: list[str] = []
+    for item in envelope.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for part in item.get("content") or []:
+            if not isinstance(part, dict):
+                continue
+            for annotation in part.get("annotations") or []:
+                if not isinstance(annotation, dict):
+                    continue
+                url = annotation.get("url") or annotation.get("source")
+                if url:
+                    found.append(str(url))
+    return found
+
+
+def x_engagement_floor(params: dict[str, Any] | None) -> int | None:
+    """Largest `post_view_count` declared on an X source, if any.
+
+    Agent Tools have no engagement filter; callers put this in the prompt.
+    """
+    floors: list[int] = []
+    for src in (params or {}).get("sources") or []:
+        if not isinstance(src, dict) or src.get("type") != "x":
+            continue
+        raw = src.get("post_view_count")
+        if raw in (None, ""):
+            continue
+        try:
+            floors.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return max(floors) if floors else None
+
+
+def engagement_floor_instruction(params: dict[str, Any] | None) -> str:
+    """System-prompt line that restores the old Live Search view floor."""
+    floor = x_engagement_floor(params)
+    if floor is None:
+        return ""
+    return (
+        f"When using X posts, prefer those with at least {floor} views. "
+        "Treat lower-engagement posts as noise."
+    )
+
+
+def _first_int(mapping: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        value = mapping.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _tool_invocation_count(usage: dict[str, Any], envelope: dict[str, Any] | None) -> int:
+    raw = usage.get("num_sources_used")
+    if raw not in (None, ""):
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            pass
+    tool_usage = usage.get("server_side_tool_usage")
+    if not isinstance(tool_usage, dict) and envelope:
+        tool_usage = envelope.get("server_side_tool_usage")
+    if not isinstance(tool_usage, dict):
+        return 0
+    total = 0
+    for value in tool_usage.values():
+        try:
+            total += int(value or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def normalize_usage(
+    usage: dict[str, Any] | None,
+    envelope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fold chat/completions and Responses usage into one CostTracker shape.
+
+    Chat completions uses `prompt_tokens` / `completion_tokens`. Responses
+    typically uses `input_tokens` / `output_tokens`, sometimes with
+    `server_side_tool_usage` instead of `num_sources_used`.
+    """
+    usage = usage or {}
+    prompt_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+    completion_details = (
+        usage.get("completion_tokens_details") or usage.get("output_tokens_details") or {}
+    )
+    if not isinstance(prompt_details, dict):
+        prompt_details = {}
+    if not isinstance(completion_details, dict):
+        completion_details = {}
+    cached = _first_int(prompt_details, "cached_tokens") or _first_int(usage, "cached_tokens")
+    reasoning = _first_int(completion_details, "reasoning_tokens") or _first_int(
+        usage, "reasoning_tokens"
+    )
+    ticks = usage.get("cost_in_usd_ticks")
+    if ticks in (None, "") and envelope:
+        ticks = envelope.get("cost_in_usd_ticks")
+    return {
+        "prompt_tokens": _first_int(usage, "prompt_tokens", "input_tokens"),
+        "completion_tokens": _first_int(usage, "completion_tokens", "output_tokens"),
+        "num_sources_used": _tool_invocation_count(usage, envelope),
+        "cost_in_usd_ticks": ticks,
+        "prompt_tokens_details": {"cached_tokens": cached},
+        "completion_tokens_details": {"reasoning_tokens": reasoning},
+    }
+
+
+def search_tools_from_policy(params: dict[str, Any] | None) -> list[dict[str, Any]] | None:
+    """Translate a Live Search policy dict into Agent Tools.
+
+    Documented tool fields only — unknown keys 400 the request:
+
+    * `news` has no dedicated tool; it is folded into `web_search`.
+    * `max_search_results` is **not** a `web_search` / `x_search` parameter
+      (xAI SDK + docs list no result-count cap). Kept in-process only.
+    * `post_view_count` is **not** an `x_search` parameter. Restored as a
+      system-prompt instruction via `engagement_floor_instruction`.
+    * `from_date` / `to_date` are documented on `x_search` only. `web_search`
+      has no date/recency filter, so web/news stay uncapped by date.
+    """
+    if not params:
+        return None
+
+    from_date = params.get("from_date")
+    to_date = params.get("to_date")
+    sources = params.get("sources") or []
+
+    want_web = False
+    want_x = False
+    allowed_domains: list[str] = []
+    excluded_domains: list[str] = []
+    allowed_handles: list[str] = []
+    excluded_handles: list[str] = []
+
+    if not sources:
+        want_web = True
+        want_x = True
+
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        stype = src.get("type")
+        if stype in {"web", "news"}:
+            want_web = True
+            allowed_domains.extend(src.get("allowed_websites") or src.get("allowed_domains") or [])
+            excluded_domains.extend(src.get("excluded_websites") or src.get("excluded_domains") or [])
+        elif stype == "x":
+            want_x = True
+            allowed_handles.extend(src.get("included_x_handles") or src.get("allowed_x_handles") or [])
+            excluded_handles.extend(src.get("excluded_x_handles") or [])
+
+    tools: list[dict[str, Any]] = []
+    if want_web:
+        tool: dict[str, Any] = {"type": "web_search"}
+        filters: dict[str, Any] = {}
+        if allowed_domains:
+            filters["allowed_domains"] = list(dict.fromkeys(allowed_domains))[:5]
+        elif excluded_domains:
+            filters["excluded_domains"] = list(dict.fromkeys(excluded_domains))[:5]
+        if filters:
+            tool["filters"] = filters
+        tools.append(tool)
+    if want_x:
+        tool = {"type": "x_search"}
+        if from_date:
+            tool["from_date"] = from_date
+        if to_date:
+            tool["to_date"] = to_date
+        if allowed_handles:
+            tool["allowed_x_handles"] = list(dict.fromkeys(allowed_handles))[:20]
+        elif excluded_handles:
+            tool["excluded_x_handles"] = list(dict.fromkeys(excluded_handles))[:20]
+        tools.append(tool)
+    return tools or None
+
+
 @dataclass
 class CostTracker:
     """Running spend, straight from what the API billed us.
 
     `cost_in_usd_ticks` is exact, so there is no reason to estimate from token
-    counts and a price table that goes stale.
+    counts and a price table that goes stale. `record` accepts both
+    chat/completions and Responses usage shapes.
     """
 
     calls: int = 0
@@ -88,9 +343,24 @@ class CostTracker:
     cost_usd: float = 0.0
     by_agent: dict[str, float] = field(default_factory=dict)
 
-    def record(self, agent: str, usage: dict[str, Any] | None) -> None:
+    def record(
+        self,
+        agent: str,
+        usage: dict[str, Any] | None,
+        envelope: dict[str, Any] | None = None,
+    ) -> None:
         self.calls += 1
-        if not usage:
+        if not usage and not envelope:
+            return
+        usage = normalize_usage(usage, envelope)
+        if not any(
+            (
+                usage.get("prompt_tokens"),
+                usage.get("completion_tokens"),
+                usage.get("num_sources_used"),
+                usage.get("cost_in_usd_ticks"),
+            )
+        ):
             return
         self.prompt_tokens += int(usage.get("prompt_tokens", 0) or 0)
         self.completion_tokens += int(usage.get("completion_tokens", 0) or 0)
@@ -147,6 +417,7 @@ class GrokAgent:
         grok = self.config.get("grok", {}) or {}
         self.api_key = grok.get("api_key", "")
         self.base_url = grok.get("base_url", "https://api.x.ai/v1/chat/completions")
+        self.responses_url = grok.get("responses_url") or derive_responses_url(self.base_url)
 
         models = grok.get("models", {}) or {}
         # Legacy keys stay readable so an old config does not silently pick a
@@ -159,6 +430,8 @@ class GrokAgent:
         self.reasoning_effort = efforts.get(self.model_tier, "none" if self.model_tier == "fast" else None)
 
         self.timeout = float(grok.get("timeout_seconds", 30))
+        # Agent Tools run a server-side loop; 30s is often tight for pulse.
+        self.tool_timeout = float(grok.get("tool_timeout_seconds", max(self.timeout, 60.0)))
         self.max_retries = int(grok.get("max_retries", 3))
         self.max_backoff = float(grok.get("max_backoff_seconds", 30))
         self.structured_outputs = bool(grok.get("structured_outputs", True))
@@ -195,17 +468,31 @@ class GrokAgent:
         if recalled and isinstance(facts, dict):
             facts = {**facts, **recalled}
         rendered = json.dumps(facts, default=str, indent=None) if facts is not None else "{}"
+        system = self.PROMPT
+        # Static per agent (from SEARCH), so it stays in the cacheable prefix.
+        floor = engagement_floor_instruction(self.search_parameters())
+        if floor:
+            system = f"{system}\n\n{floor}" if system else floor
         return [
-            {"role": "system", "content": self.PROMPT},
+            {"role": "system", "content": system},
             {"role": "user", "content": rendered},
         ]
 
     def search_parameters(self) -> dict[str, Any] | None:
-        """Live-search policy for this call, or None to answer from the prior."""
+        """Retrieval policy for this call, or None to answer from the prior.
+
+        This is the in-process policy object (sources, `from_date`). It is
+        never sent on the wire — Live Search's `search_parameters` field
+        returns HTTP 410. `search_tools()` is what the request actually carries.
+        """
         if not self.live_search or self.SEARCH is None:
             return None
         params = {"max_search_results": self.max_search_results, **self.SEARCH}
         return params
+
+    def search_tools(self) -> list[dict[str, Any]] | None:
+        """Agent Tools for this call (`web_search` / `x_search`), or None."""
+        return search_tools_from_policy(self.search_parameters())
 
     def fallback(self) -> dict[str, Any]:
         """What this agent returns when the model is unusable.
@@ -221,44 +508,85 @@ class GrokAgent:
 
     # -- request assembly ---------------------------------------------------------
 
+    def output_format(self, *, responses: bool) -> dict[str, Any]:
+        """Structured-output field for the endpoint this request will hit.
+
+        Chat/completions: `response_format` (`json_schema` nested under
+        `json_schema`, or `json_object`).
+        Responses: `text.format` (flattened `{type, name, schema, strict}`),
+        per docs.x.ai structured-outputs + the live 400 that rejects
+        `response_format` on `/v1/responses`.
+        """
+        if self.structured_outputs and self.SCHEMA is not None:
+            if responses:
+                return {
+                    "text": {
+                        "format": {
+                            "type": "json_schema",
+                            "name": self.name,
+                            "schema": self.SCHEMA,
+                            "strict": True,
+                        }
+                    }
+                }
+            return {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": self.name, "schema": self.SCHEMA, "strict": True},
+                }
+            }
+        if responses:
+            return {"text": {"format": {"type": "json_object"}}}
+        return {"response_format": {"type": "json_object"}}
+
     def build_request(self, payload: Any) -> dict[str, Any]:
+        messages = self.build_messages(payload)
         body: dict[str, Any] = {
             "model": self.model,
             "temperature": 0,
-            "messages": self.build_messages(payload),
             # Sticky routing for prompt-cache hits; stable per agent by design.
             "prompt_cache_key": f"grok-desk:{self.name}",
         }
-
-        if self.structured_outputs and self.SCHEMA is not None:
-            body["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {"name": self.name, "schema": self.SCHEMA, "strict": True},
-            }
-        else:
-            body["response_format"] = {"type": "json_object"}
 
         # reasoning_effort is a grok-4.3-only parameter; sending it elsewhere errors.
         if self.reasoning_effort and self.model.startswith("grok-4.3"):
             body["reasoning_effort"] = self.reasoning_effort
 
-        search = self.search_parameters()
-        if search:
-            body["search_parameters"] = search
+        tools = self.search_tools()
+        if tools:
+            # Responses API: tools run server-side. Never send search_parameters;
+            # that field is retired and the chat/completions endpoint returns 410.
+            # Never send response_format here — xAI 400s it; use text.format.
+            body.update(self.output_format(responses=True))
+            body["input"] = messages
+            body["tools"] = tools
+            body["store"] = False
+        else:
+            body.update(self.output_format(responses=False))
+            body["messages"] = messages
 
         return body
+
+    def request_url(self, body: dict[str, Any]) -> str:
+        """Chat/completions when there is no retrieval; Responses when there is."""
+        if body.get("tools"):
+            return self.responses_url
+        return self.base_url
+
+    def request_timeout(self, body: dict[str, Any]) -> float:
+        return self.tool_timeout if body.get("tools") else self.timeout
 
     # -- transport ----------------------------------------------------------------
 
     async def _post(self, client: httpx.AsyncClient, body: dict[str, Any]) -> dict[str, Any]:
         response = await client.post(
-            self.base_url,
+            self.request_url(body),
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
             json=body,
-            timeout=self.timeout,
+            timeout=self.request_timeout(body),
         )
         response.raise_for_status()
         return response.json()
@@ -296,19 +624,20 @@ class GrokAgent:
         client = self._client
         owns_client = client is None
         if owns_client:
-            client = httpx.AsyncClient(timeout=self.timeout)
+            client = httpx.AsyncClient(timeout=max(self.timeout, self.tool_timeout))
 
         try:
             last_error: Exception | None = None
+            timeout = self.request_timeout(body)
             for attempt in range(self.max_retries):
                 try:
                     envelope = await asyncio.wait_for(
-                        self._post(client, body), timeout=self.timeout
+                        self._post(client, body), timeout=timeout
                     )
-                    self.last_usage = envelope.get("usage") or {}
-                    self.last_citations = list(envelope.get("citations") or [])
-                    self.costs.record(self.name, self.last_usage)
-                    content = envelope["choices"][0]["message"]["content"]
+                    self.last_usage = normalize_usage(envelope.get("usage"), envelope)
+                    self.last_citations = extract_citations(envelope)
+                    self.costs.record(self.name, self.last_usage, envelope)
+                    content = extract_message_content(envelope)
                     return self.postprocess(parse_json_response(content))
                 except Exception as exc:  # noqa: BLE001 - any failure means fallback
                     last_error = exc
@@ -318,6 +647,14 @@ class GrokAgent:
                         "%s attempt %d/%d failed (status=%s): %s",
                         self.name, attempt + 1, self.max_retries, status, exc,
                     )
+                    if status == 410:
+                        log.error(
+                            "%s: HTTP 410 Gone — a requested xAI feature is retired. "
+                            "Live Search (search_parameters) is gone; retrieval now "
+                            "uses Agent Tools on /v1/responses. Set grok.live_search: "
+                            "false to skip retrieval and answer from the cutoff.",
+                            self.name,
+                        )
                     if not self._should_retry(exc):
                         log.error("%s: not retryable, falling back immediately", self.name)
                         break

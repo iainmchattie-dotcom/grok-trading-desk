@@ -10,9 +10,10 @@ manager holds. A dead allocator returns 50/50. Nothing about a failure looks lik
 permission.
 
 Every agent answers under a strict JSON schema, reads live web/X/news data
-through xAI's `search_parameters`, and reports what it cost. Decisions that
-close are fed back into later prompts. See [RESEARCH.md](RESEARCH.md) for what
-the upstream docs actually say and why several defaults here are what they are.
+through xAI Agent Tools (`web_search` / `x_search` on `/v1/responses`), and
+reports what it cost. Decisions that close are fed back into later prompts.
+See [RESEARCH.md](RESEARCH.md) for what the upstream docs actually say and why
+several defaults here are what they are.
 
 ---
 
@@ -168,21 +169,32 @@ model" had stopped being true. Current defaults:
 `reasoning_effort` is a **grok-4.3-only** parameter, so it is attached by model
 slug rather than sent blindly.
 
-**Live search is not optional here.** The spec is explicit that without
-`search_parameters`, "no data will be acquired by the model" — and Grok 4.6's
-knowledge cutoff is 2026-02-01. An agent asked for "the last two weeks of news"
-with no retrieval will answer anyway, from a months-old prior. Each agent
-declares its own policy:
+**Live data is not optional here.** xAI retired Live Search
+(`search_parameters` on `/v1/chat/completions`); that field now returns
+**HTTP 410 Gone**. Retrieval agents send `web_search` / `x_search` tools on
+`/v1/responses` instead. Agents that need no retrieval (the allocator) stay on
+chat/completions. Grok 4.6's knowledge cutoff is 2026-02-01, so an agent asked
+for "the last two weeks of news" with no tools will answer anyway, from a
+months-old prior. `grok.live_search: false` is the degrade path: skip tools,
+stay on chat/completions, accept the cutoff. Each agent declares its own
+policy:
 
-| bot | sources | window |
+| bot | tools | window (X only) |
 |---|---|---|
-| insider | `sec.gov`, `secform4.com`, `openinsider.com` | 95 days |
-| analyst | SEC + financial press, news | — |
-| radar | news, X (≥1k views), web | 14 days |
-| narrative | X only (≥1k views) | — |
-| crypto_pulse | X (≥2k views), news, web | 1 day |
-| market_pulse | news, web, X (≥5k views) | 2 days |
+| insider | `web_search` (sec.gov, secform4.com, openinsider.com) | 95 days |
+| analyst | `web_search` (SEC + financial press) | — |
+| radar | `web_search` + `x_search` | 14 days |
+| narrative | `x_search` | — |
+| crypto_pulse | `web_search` + `x_search` | 1 day |
+| market_pulse | `web_search` + `x_search` | 2 days |
 | allocator | none — both pulses are already in its payload | — |
+
+Date windows are **X-only on the wire**: `from_date` / `to_date` are documented
+`x_search` parameters. `web_search` has no date or recency filter, so web/news
+results are uncapped by date. `max_search_results` is likewise in-process only
+— Agent Tools list no result-count cap, so it is not sent. Old Live Search
+`post_view_count` floors are restored as system-prompt instructions (prefer
+posts above that view count); they are not a tool filter.
 
 Citations come back with every answer and are stored on the buy record.
 
@@ -253,7 +265,7 @@ fill. `tighten_stop` is desk-side only; pump.fun has no on-chain stop.
 | Section | What it controls |
 |---|---|
 | `mode` | `paper` or `live` (live also needs the CLI flag) |
-| `grok` | API key, `models.fast` / `models.deep`, `reasoning_effort`, `structured_outputs`, `live_search`, timeout, retries |
+| `grok` | API key, `models.fast` / `models.deep`, `reasoning_effort`, `structured_outputs`, `live_search` (Agent Tools; `false` skips retrieval), `responses_url`, timeouts, retries |
 | `solana` | RPC, wallet key, Jito settings, priority fee, slippage |
 | `alpaca` | Key, secret, paper flag |
 | `risk` | Total budget, daily loss limit, open-position caps, sector cap, per-market ceilings, position sizing |

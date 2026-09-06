@@ -31,9 +31,46 @@ Now: generators run `grok-4.3` at `reasoning_effort: none`, checkers run
 `none`/`low`/`medium`/`high`, default `low`) — sending it to 4.6 is an error, so
 `base_agent` only attaches it when the slug matches.
 
+### Live Search retired — HTTP 410 Gone (2026-09)
+
+`ChatRequest.search_parameters` on `/v1/chat/completions` is gone. xAI returns
+HTTP 410 with a body pointing at the Agent Tools API
+(`https://docs.x.ai/docs/guides/tools/overview`). Confirmed on a Mac dry-run:
+`crypto_pulse` and `market_pulse` 410 immediately (not retryable), while
+`allocator` — same base URL and key, no `search_parameters` — returns 200.
+
+Replacement: `tools: [{type: web_search}, {type: x_search}]` on
+`/v1/responses`. `news` has no dedicated tool and is folded into `web_search`.
+
+What the current Agent Tools docs / xAI Python SDK actually accept (verified
+2026-09-06 against `docs.x.ai/developers/tools/web-search`,
+`docs.x.ai/developers/tools/x-search`, and `xai_sdk.tools`):
+
+| want | on the wire? | why |
+|---|---|---|
+| `from_date` / `to_date` | **`x_search` only** | documented x_search params; `web_search` has none |
+| `max_search_results` | **no** | neither tool has a result-count / max-results field (`collections_search` has `limit`; web/x do not) |
+| `post_view_count` | **no** | not an `x_search` param; restored as a system-prompt engagement floor |
+| domain / handle lists | yes | `web_search.filters.allowed_domains`, `x_search.allowed_x_handles` |
+
+So date windows are X-only; web/news are uncapped by date. The result cap stays
+in the in-process `SEARCH` dict and is not sent (unknown tool fields 400).
+Engagement floors stay in `SEARCH` as `post_view_count` and are copied into the
+system prompt so the model still prefers higher-view posts.
+
+Agents that need no retrieval stay on chat/completions.
+
+Degrade path: `grok.live_search: false` omits tools, stays on chat/completions,
+and the model answers from the training cutoff. Pulse fallbacks remain
+pessimistic (gate shut).
+
+The older Live Search notes below are kept as the policy shape agents still
+declare in-process; `base_agent` maps that dict onto tools and never puts
+`search_parameters` on the wire.
+
 ### Live search — the agents had no data
 
-`ChatRequest.search_parameters`, verbatim from the spec:
+`ChatRequest.search_parameters`, verbatim from the (pre-retirement) spec:
 
 > Set the parameters to be used for searched data. **If not set, no data will be
 > acquired by the model.**
@@ -43,7 +80,7 @@ news"), insider ("recent Form 4 filings"), and both pulse bots were answering
 from a six-month-old prior with no retrieval. Confidently. That is the single
 largest correctness defect research turned up.
 
-`search_parameters` shape:
+`search_parameters` shape (retired; mapped to Agent Tools):
 
 - `mode`: `off` | `on` | `auto` (default `auto`)
 - `sources`: list of `{type: web|news|x|rss, ...}` — defaults to web+X if omitted
@@ -68,7 +105,22 @@ are logged with the decision.
 ### Structured outputs
 
 `response_format: {"type": "json_schema", "json_schema": {"name", "schema",
-"strict": true}}` is supported on `/v1/chat/completions`. Notes from the docs:
+"strict": true}}` is supported on `/v1/chat/completions` **only**. A live
+dry-run (2026-09-06) showed `/v1/responses` rejecting it with HTTP 400:
+
+> `'response_format' is not supported on /v1/responses — use 'text.format'`
+
+The Responses shape, from the official structured-outputs guide (OpenAI SDK
+example with `web_search` tools), is flattened:
+
+```
+text: { format: { type: "json_schema", name, schema, strict: true } }
+```
+
+`json_object` becomes `text: { format: { type: "json_object" } }`. Retrieval
+agents use that; the allocator (no tools) keeps `response_format`.
+
+Notes from the docs:
 
 - `additionalProperties` must be explicitly `false`
 - Draft 2020-12 preferred; `minLength`/`maxLength` enforced up to 2048,
@@ -81,17 +133,22 @@ stays as a fallback for the `json_object` path but is no longer load-bearing.
 ### Endpoint choice
 
 `/v1/responses` is the recommended API and `/v1/chat/completions` is labelled
-legacy, but the OpenAPI spec confirms chat/completions still carries everything
-this desk needs: `response_format`, `reasoning_effort`, `search_parameters`,
-`prompt_cache_key`, `tools`, `deferred`. Staying on it — the migration buys
-nothing here and costs a rewrite of every call site.
+legacy. After Live Search's retirement, retrieval agents have to use Responses
+anyway: built-in `web_search` / `x_search` tools are documented there, and
+`search_parameters` on chat/completions is 410. No-retrieval agents (allocator)
+stay on chat/completions. `base_agent` derives `/v1/responses` from
+`grok.base_url` (override with `grok.responses_url`).
 
 ### Cost and cache accounting
 
-`usage` carries `cost_in_usd_ticks` (exact; `TICKS_IN_USD_CENT = 100_000_000`,
-so USD = ticks / 1e10), `num_sources_used` (live-search billing unit),
-`prompt_tokens_details.cached_tokens` and
-`completion_tokens_details.reasoning_tokens`.
+Chat/completions `usage` carries `cost_in_usd_ticks` (exact;
+`TICKS_IN_USD_CENT = 100_000_000`, so USD = ticks / 1e10), `num_sources_used`,
+`prompt_tokens` / `completion_tokens`, `prompt_tokens_details.cached_tokens` and
+`completion_tokens_details.reasoning_tokens`. Responses uses `input_tokens` /
+`output_tokens` (and often `server_side_tool_usage` instead of
+`num_sources_used`). `normalize_usage` folds both shapes before
+`CostTracker.record` so retrieval agents on `/v1/responses` are not
+undercounted.
 
 `prompt_cache_key` gives sticky routing for cache hits. Prompts are now built
 static-prefix-first so the constant PROMPT block is cacheable, and every agent
@@ -173,6 +230,8 @@ is off by default (`debate.enabled`) because it doubles generator calls.
 - https://docs.x.ai/openapi.json
 - https://docs.x.ai/developers/migration/may-15-retirement
 - https://docs.x.ai/docs/guides/structured-outputs
+- https://docs.x.ai/docs/guides/tools/overview
+- https://docs.x.ai/developers/tools/overview
 - https://docs.x.ai/developers/tools/x-search
 - https://docs.x.ai/developers/models
 - https://pumpportal.fun/data-api/real-time/

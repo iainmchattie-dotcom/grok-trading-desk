@@ -21,12 +21,14 @@ class FakeResponse:
         usage: dict[str, Any] | None = None,
         citations: list[str] | None = None,
         headers: dict[str, str] | None = None,
+        envelope: dict[str, Any] | None = None,
     ):
         self._content = content
         self.status_code = status_code
         self.usage = usage
         self.citations = citations
         self.headers = headers or {}
+        self._envelope = envelope
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -40,6 +42,8 @@ class FakeResponse:
             raise error
 
     def json(self) -> dict[str, Any]:
+        if self._envelope is not None:
+            return self._envelope
         body: dict[str, Any] = {"choices": [{"message": {"content": self._content}}]}
         if self.usage is not None:
             body["usage"] = self.usage
@@ -90,6 +94,12 @@ def no_sleep(monkeypatch):
         return None
 
     monkeypatch.setattr(asyncio, "sleep", instant)
+
+
+def request_user_content(body: dict[str, Any]) -> str:
+    """User-turn JSON from a chat/completions (`messages`) or Responses (`input`) body."""
+    turns = body.get("messages") or body.get("input") or []
+    return turns[1]["content"]
 
 
 CONFIG: dict[str, Any] = {

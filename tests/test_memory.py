@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from tests.conftest import CONFIG
+from tests.conftest import CONFIG, request_user_content
 from src.crypto.crypto_checker import CryptoChecker
 from src.models import Market, Position
 from src.shared.allocator import Allocator
@@ -153,7 +153,7 @@ async def test_crypto_checker_prompt_includes_past_outcomes(client_factory):
     agent.memory = mem()
     await agent.run({"token": {"symbol": "NEWDOG"}, "narrative": {"theme": "dog"}})
 
-    sent = agent._client.calls[0]["json"]["messages"][1]["content"]
+    sent = request_user_content(agent._client.calls[0]["json"])
     assert "past_outcomes" in sent
     assert "PUPPY" in sent            # the losing dog trade is in front of it
 
@@ -164,7 +164,7 @@ async def test_exit_manager_prompt_includes_past_outcomes(client_factory):
     await agent.run(Position(market=Market.STOCKS, symbol="ACME", quantity=1,
                              entry_price=10.0, sector="tech"))
 
-    sent = agent._client.calls[0]["json"]["messages"][1]["content"]
+    sent = request_user_content(agent._client.calls[0]["json"])
     assert "past_outcomes" in sent and "ACME" in sent
 
 
@@ -180,5 +180,5 @@ async def test_allocator_prompt_includes_both_track_records(client_factory):
 async def test_no_memory_attached_leaves_the_prompt_alone(client_factory):
     agent = CryptoChecker(CONFIG, client=client_factory({"approve": False}))
     await agent.run({"token": {"symbol": "X"}})
-    sent = agent._client.calls[0]["json"]["messages"][1]["content"]
+    sent = request_user_content(agent._client.calls[0]["json"])
     assert "past_outcomes" not in sent
