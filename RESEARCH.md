@@ -31,9 +31,30 @@ Now: generators run `grok-4.3` at `reasoning_effort: none`, checkers run
 `none`/`low`/`medium`/`high`, default `low`) — sending it to 4.6 is an error, so
 `base_agent` only attaches it when the slug matches.
 
+### Live Search retired — HTTP 410 Gone (2026-09)
+
+`ChatRequest.search_parameters` on `/v1/chat/completions` is gone. xAI returns
+HTTP 410 with a body pointing at the Agent Tools API
+(`https://docs.x.ai/docs/guides/tools/overview`). Confirmed on a Mac dry-run:
+`crypto_pulse` and `market_pulse` 410 immediately (not retryable), while
+`allocator` — same base URL and key, no `search_parameters` — returns 200.
+
+Replacement: `tools: [{type: web_search}, {type: x_search}]` on
+`/v1/responses`. `news` has no dedicated tool and is folded into `web_search`.
+`from_date` is a documented `x_search` parameter; `post_view_count` is not and
+must not be sent. Agents that need no retrieval stay on chat/completions.
+
+Degrade path: `grok.live_search: false` omits tools, stays on chat/completions,
+and the model answers from the training cutoff. Pulse fallbacks remain
+pessimistic (gate shut).
+
+The older Live Search notes below are kept as the policy shape agents still
+declare in-process; `base_agent` maps that dict onto tools and never puts
+`search_parameters` on the wire.
+
 ### Live search — the agents had no data
 
-`ChatRequest.search_parameters`, verbatim from the spec:
+`ChatRequest.search_parameters`, verbatim from the (pre-retirement) spec:
 
 > Set the parameters to be used for searched data. **If not set, no data will be
 > acquired by the model.**
@@ -43,7 +64,7 @@ news"), insider ("recent Form 4 filings"), and both pulse bots were answering
 from a six-month-old prior with no retrieval. Confidently. That is the single
 largest correctness defect research turned up.
 
-`search_parameters` shape:
+`search_parameters` shape (retired; mapped to Agent Tools):
 
 - `mode`: `off` | `on` | `auto` (default `auto`)
 - `sources`: list of `{type: web|news|x|rss, ...}` — defaults to web+X if omitted
@@ -81,10 +102,11 @@ stays as a fallback for the `json_object` path but is no longer load-bearing.
 ### Endpoint choice
 
 `/v1/responses` is the recommended API and `/v1/chat/completions` is labelled
-legacy, but the OpenAPI spec confirms chat/completions still carries everything
-this desk needs: `response_format`, `reasoning_effort`, `search_parameters`,
-`prompt_cache_key`, `tools`, `deferred`. Staying on it — the migration buys
-nothing here and costs a rewrite of every call site.
+legacy. After Live Search's retirement, retrieval agents have to use Responses
+anyway: built-in `web_search` / `x_search` tools are documented there, and
+`search_parameters` on chat/completions is 410. No-retrieval agents (allocator)
+stay on chat/completions. `base_agent` derives `/v1/responses` from
+`grok.base_url` (override with `grok.responses_url`).
 
 ### Cost and cache accounting
 
@@ -173,6 +195,8 @@ is off by default (`debate.enabled`) because it doubles generator calls.
 - https://docs.x.ai/openapi.json
 - https://docs.x.ai/developers/migration/may-15-retirement
 - https://docs.x.ai/docs/guides/structured-outputs
+- https://docs.x.ai/docs/guides/tools/overview
+- https://docs.x.ai/developers/tools/overview
 - https://docs.x.ai/developers/tools/x-search
 - https://docs.x.ai/developers/models
 - https://pumpportal.fun/data-api/real-time/

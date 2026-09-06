@@ -4,11 +4,22 @@ import httpx
 import pytest
 
 from tests.conftest import CONFIG, FakeResponse
-from src.base_agent import CostTracker, GrokAgent, parse_json_response, schema
+from datetime import date, timedelta
+
+from src.base_agent import (
+    CostTracker,
+    GrokAgent,
+    derive_responses_url,
+    extract_message_content,
+    parse_json_response,
+    schema,
+)
 from src.crypto.auditor import Auditor
 from src.crypto.crypto_checker import CryptoChecker
+from src.crypto.crypto_pulse import CryptoPulse
 from src.shared.allocator import Allocator
 from src.stocks.insider import Insider
+from src.stocks.market_pulse import MarketPulse
 from src.stocks.radar import Radar
 
 
@@ -76,36 +87,92 @@ def test_model_defaults_split_the_tiers():
     assert CryptoChecker({}).model == "grok-4.6"
 
 
-# --- live search -------------------------------------------------------------------
+# --- Agent Tools (Live Search was retired; search_parameters is HTTP 410) ----------
 
-def test_search_parameters_are_sent_when_an_agent_declares_them():
-    body = Radar(CONFIG).build_request({"symbol": "ACME"})
-    search = body["search_parameters"]
-    assert search["mode"] == "on"
-    assert {s["type"] for s in search["sources"]} == {"news", "x", "web"}
-    assert "from_date" in search       # radar's prompt asks for two weeks
+def test_retrieval_agents_send_tools_not_search_parameters():
+    radar = Radar(CONFIG)
+    body = radar.build_request({"symbol": "ACME"})
+    assert "search_parameters" not in body
+    assert {t["type"] for t in body["tools"]} == {"web_search", "x_search"}
+    assert body["input"][0]["role"] == "system"
+    assert "messages" not in body
+    x = next(t for t in body["tools"] if t["type"] == "x_search")
+    assert x["from_date"] == (date.today() - timedelta(days=14)).isoformat()
+    assert radar.request_url(body).endswith("/responses")
 
 
 def test_insider_whitelists_primary_filing_sources():
-    search = Insider(CONFIG).build_request({"symbol": "ACME"})["search_parameters"]
-    web = next(s for s in search["sources"] if s["type"] == "web")
-    assert "sec.gov" in web["allowed_websites"]
-    assert len(web["allowed_websites"]) <= 5   # API caps the whitelist at 5
+    body = Insider(CONFIG).build_request({"symbol": "ACME"})
+    assert "search_parameters" not in body
+    web = next(t for t in body["tools"] if t["type"] == "web_search")
+    assert "sec.gov" in web["filters"]["allowed_domains"]
+    assert len(web["filters"]["allowed_domains"]) <= 5   # API caps the whitelist at 5
 
 
-def test_agents_that_need_no_retrieval_send_none():
-    assert "search_parameters" not in Allocator(CONFIG).build_request({})
+def test_agents_that_need_no_retrieval_stay_on_chat_completions():
+    alloc = Allocator(CONFIG)
+    body = alloc.build_request({})
+    assert "search_parameters" not in body
+    assert "tools" not in body
+    assert "messages" in body
+    assert alloc.request_url(body).endswith("/chat/completions")
 
 
 def test_live_search_can_be_switched_off_globally():
     config = {"grok": {**CONFIG["grok"], "live_search": False}}
-    assert "search_parameters" not in Radar(config).build_request({"symbol": "A"})
+    radar = Radar(config)
+    body = radar.build_request({"symbol": "A"})
+    assert "search_parameters" not in body
+    assert "tools" not in body
+    assert radar.request_url(body).endswith("/chat/completions")
 
 
-def test_x_source_carries_an_engagement_floor():
-    search = Auditor(CONFIG).build_request({"mint": "M"})["search_parameters"]
-    x = next(s for s in search["sources"] if s["type"] == "x")
-    assert x["post_view_count"] > 0
+def test_x_source_becomes_x_search_tool():
+    tools = Auditor(CONFIG).build_request({"mint": "M"})["tools"]
+    assert any(t["type"] == "x_search" for t in tools)
+    # post_view_count is not a tool parameter; do not send unknown fields
+    x = next(t for t in tools if t["type"] == "x_search")
+    assert "post_view_count" not in x
+
+
+def test_pulse_agents_use_responses_and_date_window():
+    crypto = CryptoPulse(CONFIG)
+    crypto_body = crypto.build_request(None)
+    assert "search_parameters" not in crypto_body
+    assert {t["type"] for t in crypto_body["tools"]} == {"web_search", "x_search"}
+    crypto_x = next(t for t in crypto_body["tools"] if t["type"] == "x_search")
+    assert crypto_x["from_date"] == (date.today() - timedelta(days=1)).isoformat()
+    assert crypto.request_url(crypto_body) == "https://api.x.ai/v1/responses"
+
+    market = MarketPulse(CONFIG)
+    market_body = market.build_request(None)
+    assert "search_parameters" not in market_body
+    market_x = next(t for t in market_body["tools"] if t["type"] == "x_search")
+    assert market_x["from_date"] == (date.today() - timedelta(days=2)).isoformat()
+    assert market.request_url(market_body).endswith("/responses")
+
+
+def test_derive_responses_url_from_chat_completions():
+    assert derive_responses_url("https://api.x.ai/v1/chat/completions") == (
+        "https://api.x.ai/v1/responses"
+    )
+    assert derive_responses_url("https://api.x.ai/v1") == "https://api.x.ai/v1/responses"
+    assert derive_responses_url("https://api.x.ai/v1/responses") == (
+        "https://api.x.ai/v1/responses"
+    )
+
+
+def test_extract_message_content_reads_both_envelopes():
+    chat = {"choices": [{"message": {"content": '{"ok": true}'}}]}
+    assert extract_message_content(chat) == '{"ok": true}'
+    responses = {
+        "output": [
+            {"type": "web_search_call"},
+            {"type": "message", "content": [{"type": "output_text", "text": '{"ok": true}'}]},
+        ]
+    }
+    assert extract_message_content(responses) == '{"ok": true}'
+    assert extract_message_content({"output_text": '{"ok": true}'}) == '{"ok": true}'
 
 
 # --- retry policy ---------------------------------------------------------------------
@@ -115,6 +182,18 @@ async def test_a_400_is_not_retried(client_factory, no_sleep):
     result = await Probe(CONFIG, client=client).run()
     assert result["why"] == "fallback"
     assert len(client.calls) == 1     # our bug; repeating it three times is waste
+
+
+async def test_a_410_is_not_retried_and_pulse_stays_shut(client_factory, no_sleep):
+    client = client_factory(FakeResponse("", 410))
+    result = await CryptoPulse(CONFIG, client=client).run()
+    assert result["go_signal"] == 0.0
+    assert result["regime"] == "risk_off"
+    assert result["notes"] == "crypto_pulse_unavailable"
+    assert len(client.calls) == 1
+    # the retired Live Search field must not be on the wire
+    assert "search_parameters" not in client.calls[0]["json"]
+    assert client.calls[0]["url"].endswith("/responses")
 
 
 async def test_a_429_is_retried(client_factory, no_sleep):
@@ -215,6 +294,31 @@ async def test_citations_are_captured(client_factory):
     ))
     await agent.run()
     assert agent.last_citations == ["https://sec.gov/x", "https://x.com/y"]
+
+
+async def test_run_parses_a_responses_envelope(client_factory):
+    envelope = {
+        "output": [
+            {"type": "web_search_call"},
+            {
+                "type": "message",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": '{"regime": "neutral", "go_signal": 0.4, "risk_appetite": 0.3}',
+                        "annotations": [{"url": "https://example.com/sol"}],
+                    }
+                ],
+            },
+        ],
+        "usage": USAGE,
+    }
+    pulse = CryptoPulse(CONFIG, client=client_factory(FakeResponse("", envelope=envelope)))
+    result = await pulse.run()
+    assert result["regime"] == "neutral"
+    assert result["go_signal"] == 0.4
+    assert pulse.last_citations == ["https://example.com/sol"]
+    assert pulse.costs.snapshot()["cost_usd"] == pytest.approx(2.5)
 
 
 # --- parsing still guards the json_object path ----------------------------------------

@@ -1,17 +1,18 @@
 """Base class for every LLM-backed bot.
 
-Wraps one xAI chat completion: strict structured output, live search, retry
+Wraps one xAI call: strict structured output, Agent Tools retrieval, retry
 policy, cost accounting, and — most importantly — the pessimistic fallback. Every
 subclass declares what "we could not get an answer" means for it; the desk never
 sees a raised exception from an agent.
 
-Three things here come straight from the OpenAPI spec (see RESEARCH.md):
+Three things here come straight from the upstream docs (see RESEARCH.md):
 
 * `response_format: json_schema` with `strict: true` makes the model return the
   shape we asked for, so parsing is no longer the weak link.
-* `search_parameters` is what gives an agent real data. Without it the docs are
-  explicit that "no data will be acquired by the model" — the model answers from
-  a training cutoff months in the past.
+* Live Search (`search_parameters` on `/v1/chat/completions`) was retired and
+  now returns HTTP 410 Gone. Agents that need current data send `web_search` /
+  `x_search` tools on `/v1/responses` instead. `grok.live_search: false` skips
+  retrieval and answers from the training cutoff.
 * `reasoning_effort` is only supported by grok-4.3, so it is attached by model
   slug rather than sent blindly.
 """
@@ -36,8 +37,10 @@ _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 TICKS_PER_USD = 10_000_000_000
 
 #: Only these deserve another attempt. A 400/422 is a bug in our request and
-#: will fail identically three times in a row.
+#: will fail identically three times in a row. 410 means the feature is gone.
 RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 
 
 def parse_json_response(text: str) -> dict[str, Any]:
@@ -67,6 +70,150 @@ def parse_json_response(text: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError(f"expected a JSON object, got {type(parsed).__name__}")
     return parsed
+
+
+def derive_responses_url(chat_url: str) -> str:
+    """Map a chat/completions URL to the Responses API sibling.
+
+    Agent Tools (`web_search`, `x_search`) are served on `/v1/responses`.
+    Allocators and other no-retrieval agents stay on chat/completions.
+    """
+    url = (chat_url or "").rstrip("/")
+    if url.endswith(_CHAT_COMPLETIONS_SUFFIX):
+        return url[: -len(_CHAT_COMPLETIONS_SUFFIX)] + "/responses"
+    if url.endswith("/responses"):
+        return url
+    if url.endswith("/v1"):
+        return f"{url}/responses"
+    return f"{url}/responses" if url else "https://api.x.ai/v1/responses"
+
+
+def _text_from_content(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content") or ""
+                if text:
+                    parts.append(str(text))
+        return "".join(parts)
+    return str(content)
+
+
+def extract_message_content(envelope: dict[str, Any]) -> str:
+    """Pull the model text out of a chat/completions or Responses envelope."""
+    choices = envelope.get("choices")
+    if isinstance(choices, list) and choices:
+        message = (choices[0] or {}).get("message") or {}
+        text = _text_from_content(message.get("content"))
+        if text:
+            return text
+
+    output_text = envelope.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    texts: list[str] = []
+    for item in envelope.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in {None, "message", "output_text"}:
+            text = _text_from_content(item.get("content") or item.get("text"))
+            if text:
+                texts.append(text)
+    if texts:
+        return "".join(texts)
+    raise ValueError("no message content in response")
+
+
+def extract_citations(envelope: dict[str, Any]) -> list[str]:
+    """Citations from either API shape (top-level list or output annotations)."""
+    raw = envelope.get("citations")
+    if isinstance(raw, list) and raw:
+        return [str(item) for item in raw if item]
+
+    found: list[str] = []
+    for item in envelope.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for part in item.get("content") or []:
+            if not isinstance(part, dict):
+                continue
+            for annotation in part.get("annotations") or []:
+                if not isinstance(annotation, dict):
+                    continue
+                url = annotation.get("url") or annotation.get("source")
+                if url:
+                    found.append(str(url))
+    return found
+
+
+def search_tools_from_policy(params: dict[str, Any] | None) -> list[dict[str, Any]] | None:
+    """Translate a Live Search policy dict into Agent Tools.
+
+    `news` has no dedicated tool; it is folded into `web_search`. Engagement
+    floors (`post_view_count`) are not accepted by `x_search` and are dropped.
+    """
+    if not params:
+        return None
+
+    from_date = params.get("from_date")
+    to_date = params.get("to_date")
+    sources = params.get("sources") or []
+
+    want_web = False
+    want_x = False
+    allowed_domains: list[str] = []
+    excluded_domains: list[str] = []
+    allowed_handles: list[str] = []
+    excluded_handles: list[str] = []
+
+    if not sources:
+        want_web = True
+        want_x = True
+
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        stype = src.get("type")
+        if stype in {"web", "news"}:
+            want_web = True
+            allowed_domains.extend(src.get("allowed_websites") or src.get("allowed_domains") or [])
+            excluded_domains.extend(src.get("excluded_websites") or src.get("excluded_domains") or [])
+        elif stype == "x":
+            want_x = True
+            allowed_handles.extend(src.get("included_x_handles") or src.get("allowed_x_handles") or [])
+            excluded_handles.extend(src.get("excluded_x_handles") or [])
+
+    tools: list[dict[str, Any]] = []
+    if want_web:
+        tool: dict[str, Any] = {"type": "web_search"}
+        filters: dict[str, Any] = {}
+        if allowed_domains:
+            filters["allowed_domains"] = list(dict.fromkeys(allowed_domains))[:5]
+        elif excluded_domains:
+            filters["excluded_domains"] = list(dict.fromkeys(excluded_domains))[:5]
+        if filters:
+            tool["filters"] = filters
+        tools.append(tool)
+    if want_x:
+        tool = {"type": "x_search"}
+        if from_date:
+            tool["from_date"] = from_date
+        if to_date:
+            tool["to_date"] = to_date
+        if allowed_handles:
+            tool["allowed_x_handles"] = list(dict.fromkeys(allowed_handles))[:20]
+        elif excluded_handles:
+            tool["excluded_x_handles"] = list(dict.fromkeys(excluded_handles))[:20]
+        tools.append(tool)
+    return tools or None
 
 
 @dataclass
@@ -147,6 +294,7 @@ class GrokAgent:
         grok = self.config.get("grok", {}) or {}
         self.api_key = grok.get("api_key", "")
         self.base_url = grok.get("base_url", "https://api.x.ai/v1/chat/completions")
+        self.responses_url = grok.get("responses_url") or derive_responses_url(self.base_url)
 
         models = grok.get("models", {}) or {}
         # Legacy keys stay readable so an old config does not silently pick a
@@ -159,6 +307,8 @@ class GrokAgent:
         self.reasoning_effort = efforts.get(self.model_tier, "none" if self.model_tier == "fast" else None)
 
         self.timeout = float(grok.get("timeout_seconds", 30))
+        # Agent Tools run a server-side loop; 30s is often tight for pulse.
+        self.tool_timeout = float(grok.get("tool_timeout_seconds", max(self.timeout, 60.0)))
         self.max_retries = int(grok.get("max_retries", 3))
         self.max_backoff = float(grok.get("max_backoff_seconds", 30))
         self.structured_outputs = bool(grok.get("structured_outputs", True))
@@ -201,11 +351,20 @@ class GrokAgent:
         ]
 
     def search_parameters(self) -> dict[str, Any] | None:
-        """Live-search policy for this call, or None to answer from the prior."""
+        """Retrieval policy for this call, or None to answer from the prior.
+
+        This is the in-process policy object (sources, `from_date`). It is
+        never sent on the wire — Live Search's `search_parameters` field
+        returns HTTP 410. `search_tools()` is what the request actually carries.
+        """
         if not self.live_search or self.SEARCH is None:
             return None
         params = {"max_search_results": self.max_search_results, **self.SEARCH}
         return params
+
+    def search_tools(self) -> list[dict[str, Any]] | None:
+        """Agent Tools for this call (`web_search` / `x_search`), or None."""
+        return search_tools_from_policy(self.search_parameters())
 
     def fallback(self) -> dict[str, Any]:
         """What this agent returns when the model is unusable.
@@ -222,10 +381,10 @@ class GrokAgent:
     # -- request assembly ---------------------------------------------------------
 
     def build_request(self, payload: Any) -> dict[str, Any]:
+        messages = self.build_messages(payload)
         body: dict[str, Any] = {
             "model": self.model,
             "temperature": 0,
-            "messages": self.build_messages(payload),
             # Sticky routing for prompt-cache hits; stable per agent by design.
             "prompt_cache_key": f"grok-desk:{self.name}",
         }
@@ -242,23 +401,38 @@ class GrokAgent:
         if self.reasoning_effort and self.model.startswith("grok-4.3"):
             body["reasoning_effort"] = self.reasoning_effort
 
-        search = self.search_parameters()
-        if search:
-            body["search_parameters"] = search
+        tools = self.search_tools()
+        if tools:
+            # Responses API: tools run server-side. Never send search_parameters;
+            # that field is retired and the chat/completions endpoint returns 410.
+            body["input"] = messages
+            body["tools"] = tools
+            body["store"] = False
+        else:
+            body["messages"] = messages
 
         return body
+
+    def request_url(self, body: dict[str, Any]) -> str:
+        """Chat/completions when there is no retrieval; Responses when there is."""
+        if body.get("tools"):
+            return self.responses_url
+        return self.base_url
+
+    def request_timeout(self, body: dict[str, Any]) -> float:
+        return self.tool_timeout if body.get("tools") else self.timeout
 
     # -- transport ----------------------------------------------------------------
 
     async def _post(self, client: httpx.AsyncClient, body: dict[str, Any]) -> dict[str, Any]:
         response = await client.post(
-            self.base_url,
+            self.request_url(body),
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
             json=body,
-            timeout=self.timeout,
+            timeout=self.request_timeout(body),
         )
         response.raise_for_status()
         return response.json()
@@ -296,19 +470,20 @@ class GrokAgent:
         client = self._client
         owns_client = client is None
         if owns_client:
-            client = httpx.AsyncClient(timeout=self.timeout)
+            client = httpx.AsyncClient(timeout=max(self.timeout, self.tool_timeout))
 
         try:
             last_error: Exception | None = None
+            timeout = self.request_timeout(body)
             for attempt in range(self.max_retries):
                 try:
                     envelope = await asyncio.wait_for(
-                        self._post(client, body), timeout=self.timeout
+                        self._post(client, body), timeout=timeout
                     )
                     self.last_usage = envelope.get("usage") or {}
-                    self.last_citations = list(envelope.get("citations") or [])
+                    self.last_citations = extract_citations(envelope)
                     self.costs.record(self.name, self.last_usage)
-                    content = envelope["choices"][0]["message"]["content"]
+                    content = extract_message_content(envelope)
                     return self.postprocess(parse_json_response(content))
                 except Exception as exc:  # noqa: BLE001 - any failure means fallback
                     last_error = exc
@@ -318,6 +493,14 @@ class GrokAgent:
                         "%s attempt %d/%d failed (status=%s): %s",
                         self.name, attempt + 1, self.max_retries, status, exc,
                     )
+                    if status == 410:
+                        log.error(
+                            "%s: HTTP 410 Gone — a requested xAI feature is retired. "
+                            "Live Search (search_parameters) is gone; retrieval now "
+                            "uses Agent Tools on /v1/responses. Set grok.live_search: "
+                            "false to skip retrieval and answer from the cutoff.",
+                            self.name,
+                        )
                     if not self._should_retry(exc):
                         log.error("%s: not retryable, falling back immediately", self.name)
                         break
