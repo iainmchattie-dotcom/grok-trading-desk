@@ -6,6 +6,7 @@ Every test injects RPC/HTTP fakes. Nothing here talks to mainnet.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 
 import pytest
@@ -260,7 +261,82 @@ def test_jito_tip_accounts_are_valid_pubkeys():
         Pubkey.from_string(address)
 
 
+def test_fee_recipients_rotate_by_mint_and_honor_overrides():
+    mint_a = str(Keypair().pubkey())
+    mint_b = str(Keypair().pubkey())
+    fee_a, back_a = onchain.select_pump_fee_recipients(mint_a)
+    fee_a2, back_a2 = onchain.select_pump_fee_recipients(mint_a)
+    fee_b, _back_b = onchain.select_pump_fee_recipients(mint_b)
+    assert fee_a == fee_a2 and back_a == back_a2
+    assert fee_a in onchain.PUMP_FEE_RECIPIENTS
+    assert back_a in onchain.PUMP_BUYBACK_FEE_RECIPIENTS
+    # Different mints should not all collapse to index 0.
+    many = {onchain.select_pump_fee_recipients(str(Keypair().pubkey()))[0] for _ in range(24)}
+    assert len(many) > 1
+    assert fee_b in onchain.PUMP_FEE_RECIPIENTS
+    override = onchain.PUMP_FEE_RECIPIENTS[3]
+    picked, _ = onchain.select_pump_fee_recipients(mint_a, fee_recipient=override)
+    assert picked == override
+    mayhem, _ = onchain.select_pump_fee_recipients(mint_a, is_mayhem_mode=True)
+    assert mayhem in onchain.PUMP_MAYHEM_FEE_RECIPIENTS
+    assert mayhem not in onchain.PUMP_FEE_RECIPIENTS
+
+
+def _ix_kinds(ixs) -> dict[str, int]:
+    kinds: dict[str, int] = {}
+    for ix in ixs:
+        program = str(ix.program_id)
+        data = bytes(ix.data)
+        if program == onchain.ASSOCIATED_TOKEN_PROGRAM:
+            kinds["ata"] = kinds.get("ata", 0) + 1
+        elif program == onchain.SYSTEM_PROGRAM:
+            kinds["transfer"] = kinds.get("transfer", 0) + 1
+        elif program == onchain.TOKEN_PROGRAM and data[:1] == bytes([17]):
+            kinds["sync_native"] = kinds.get("sync_native", 0) + 1
+        elif program == onchain.TOKEN_PROGRAM and data[:1] == bytes([9]):
+            kinds["close_wsol"] = kinds.get("close_wsol", 0) + 1
+        elif program == onchain.PUMP_PROGRAM:
+            kinds["pump"] = kinds.get("pump", 0) + 1
+    return kinds
+
+
 # -- paper path --------------------------------------------------------------------
+
+async def test_pump_buy_wraps_sol_before_the_buy_ix_and_paper_does_not_broadcast():
+    mint, _creator, accounts = _pump_world(decimals=6)
+    rpc = FakeRpc(accounts)
+    executor = _executor(rpc=rpc)  # paper
+    quote = await executor._quote_buy(mint, executor._usd_to_lamports(20.0))
+    ixs = await executor._pump_instructions(mint, "buy", quote)
+    kinds = _ix_kinds(ixs)
+    assert kinds.get("ata", 0) >= 2  # base mint ATA + WSOL ATA
+    assert kinds.get("transfer", 0) >= 1
+    assert kinds.get("sync_native", 0) == 1
+    assert kinds.get("pump", 0) == 1
+    assert kinds.get("close_wsol", 0) == 1
+    # Wrap must land before buy_v2 so the quote ATA is funded.
+    programs = [str(ix.program_id) for ix in ixs]
+    sync_at = next(i for i, ix in enumerate(ixs) if bytes(ix.data)[:1] == bytes([17]))
+    pump_at = programs.index(onchain.PUMP_PROGRAM)
+    assert sync_at < pump_at
+
+    fill = await executor.buy(mint, 20.0)
+    assert fill["paper"] is True
+    assert rpc.sent is False
+    assert not any(method == "sendTransaction" for method, _ in rpc.calls)
+
+
+async def test_fee_override_from_config_lands_on_the_buy_ix():
+    mint, _creator, accounts = _pump_world(decimals=6)
+    override = onchain.PUMP_FEE_RECIPIENTS[5]
+    config = _config()
+    config["solana"]["pump"] = {"fee_recipient": override, "buyback_fee_recipient": ""}
+    executor = _executor(rpc=FakeRpc(accounts), config=config)
+    quote = await executor._quote_buy(mint, executor._usd_to_lamports(20.0))
+    ixs = await executor._pump_instructions(mint, "buy", quote)
+    buy_ix = next(ix for ix in ixs if str(ix.program_id) == onchain.PUMP_PROGRAM)
+    assert str(buy_ix.accounts[6].pubkey) == override
+
 
 async def test_paper_buy_quotes_the_bonding_curve_and_never_sends():
     mint, _creator, accounts = _pump_world(decimals=8)
@@ -469,29 +545,48 @@ async def test_unconfirmed_bundle_is_a_failure_not_a_fill():
     assert mint not in executor._lots
 
 
-async def test_partial_fill_is_a_failure():
+async def test_partial_fill_is_a_failure_but_credits_stranded_inventory(tmp_path):
     mint, _creator, accounts = _pump_world(decimals=6)
     rpc = FakeRpc(accounts)
     rpc.mint = mint
-    executor = _executor(rpc=rpc, live=True)
+    event_log = EventLog({"logging": {"path": str(tmp_path / "desk.jsonl"), "echo_stdout": False}})
+    executor = _executor(rpc=rpc, live=True, event_log=event_log)
     quote = await executor._quote_buy(mint, executor._usd_to_lamports(20.0))
-    rpc.token_raw = max(1, quote.min_out // 2)  # confirmed, but short
+    landed = max(1, quote.min_out // 2)  # confirmed, but short
+    rpc.token_raw = landed
 
     with pytest.raises(ExecutionFailed) as err:
         await executor.buy(mint, 20.0)
     assert err.value.reason == "partial_fill"
-    assert mint not in executor._lots
+    assert err.value.stranded["raw_amount"] == landed
+    assert err.value.stranded["signature"]
+    # Tokens must stay on the book so get_positions can see them.
+    assert mint in executor._lots
+    assert executor._lots[mint].raw_amount == landed
+    kinds = [json.loads(line)["type"] for line in open(tmp_path / "desk.jsonl")]
+    assert "stranded" in kinds
+    assert "buy" not in kinds
+
+    executor.dust_usd = 0
+    positions = await executor.get_positions()
+    assert any(p.meta["mint"] == mint for p in positions)
 
 
-async def test_zero_fill_after_confirm_is_a_failure():
+async def test_zero_fill_after_confirm_records_stranded_and_stays_empty(tmp_path):
     mint, _creator, accounts = _pump_world(decimals=6)
     rpc = FakeRpc(accounts)
     rpc.mint = mint
     rpc.token_raw = 0
-    executor = _executor(rpc=rpc, live=True)
+    event_log = EventLog({"logging": {"path": str(tmp_path / "desk.jsonl"), "echo_stdout": False}})
+    executor = _executor(rpc=rpc, live=True, event_log=event_log)
     with pytest.raises(ExecutionFailed) as err:
         await executor.buy(mint, 20.0)
     assert err.value.reason == "zero_fill"
+    assert err.value.stranded["raw_amount"] == 0
+    assert mint not in executor._lots
+    records = [json.loads(line) for line in open(tmp_path / "desk.jsonl")]
+    assert records[-1]["type"] == "stranded"
+    assert records[-1]["raw_amount"] == 0
 
 
 async def test_live_without_a_wallet_key_fails():
@@ -574,3 +669,62 @@ async def test_desk_skips_when_the_executor_fails(tmp_path):
     assert result["bought"] is False
     assert result["reason"] == "bundle_rejected"
     assert desk.positions == []
+
+
+async def test_desk_surfaces_stranded_partial_without_calling_it_a_buy(tmp_path):
+    from tests.test_desk import TOKEN, build
+
+    desk = build(tmp_path, dry_run=False)
+    mint = TOKEN.mint
+
+    class Partial:
+        async def buy(self, *a, **k):
+            raise ExecutionFailed(
+                "partial_fill",
+                "short",
+                stranded={
+                    "mint": mint,
+                    "side": "buy",
+                    "signature": "SigPartial111111111111111111111111111111111",
+                    "raw_amount": 50,
+                    "quantity": 50.0,
+                    "decimals": 6,
+                    "expected_raw": 100,
+                },
+            )
+
+        async def get_positions(self):
+            return []
+
+        async def aclose(self):
+            return None
+
+    desk.crypto_executor = Partial()
+    result = await desk.evaluate_token(TOKEN)
+    assert result["bought"] is False
+    assert result["reason"] == "partial_fill"
+    assert result["stranded"]["raw_amount"] == 50
+    assert len(desk.positions) == 1
+    assert desk.positions[0].meta["stranded"] is True
+    assert desk.risk.deployed_usd[Market.CRYPTO] > 0
+    records = [json.loads(line) for line in open(tmp_path / "desk.jsonl")]
+    kinds = [r["type"] for r in records]
+    assert "skip" in kinds
+    assert "buy" not in kinds
+
+
+async def test_owned_http_client_closes():
+    executor = CryptoExecutor(_config(), http=None, rpc=FakeRpc(), keypair=Keypair())
+
+    class Owned:
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    owned = Owned()
+    executor._http_owned = owned
+    await executor.aclose()
+    assert owned.closed is True
+    assert executor._http_owned is None

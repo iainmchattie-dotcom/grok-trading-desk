@@ -40,12 +40,17 @@ class ExecutionFailed(Exception):
     dropped Jito bundles and unconfirmed RPC sends all land here — never as
     success. The risk manager sizes the next trade off what it believes is
     deployed; a silent no-op would lie to it.
+
+    When a transaction confirms but the wallet delta is short, `stranded`
+    carries the inventory that landed so the desk can see it. Failure stays
+    a failure; the tokens must not vanish from the book.
     """
 
-    def __init__(self, reason: str, detail: str = ""):
+    def __init__(self, reason: str, detail: str = "", stranded: dict[str, Any] | None = None):
         super().__init__(f"{reason}: {detail}" if detail else reason)
         self.reason = reason
         self.detail = detail
+        self.stranded = stranded or {}
 
 
 @dataclass
@@ -119,6 +124,10 @@ class CryptoExecutor:
         self.jito_url = str(jito.get("block_engine_url", "") or "").rstrip("/")
         self.tip_lamports = int(jito.get("tip_lamports", 0) or 0)
 
+        pump_exec = solana.get("pump", {}) or {}
+        self.fee_recipient_override = str(pump_exec.get("fee_recipient") or "") or None
+        self.buyback_fee_override = str(pump_exec.get("buyback_fee_recipient") or "") or None
+
         self.event_log = event_log
         self._rpc = rpc if rpc is not None else client
         self._http = http
@@ -130,6 +139,19 @@ class CryptoExecutor:
         self._stops: dict[str, float] = {}
         self._lots: dict[str, _Lot] = {}
         self._opened: set[str] = set()
+
+    async def aclose(self) -> None:
+        """Close the httpx client we created. Injected clients are left alone."""
+        owned = self._http_owned
+        self._http_owned = None
+        if owned is not None and hasattr(owned, "aclose"):
+            await owned.aclose()
+
+    async def __aenter__(self) -> "CryptoExecutor":
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        await self.aclose()
 
     # -- SDK plumbing ---------------------------------------------------------------
 
@@ -399,7 +421,15 @@ class CryptoExecutor:
         tx_id = await self._execute(mint, "buy", quote)
         after = await self._token_balance_raw(mint)
         filled_raw = after - before
-        self._assert_full_fill(filled_raw, quote.min_out, side="buy")
+        self._reconcile_fill(
+            mint=mint,
+            side="buy",
+            filled_raw=filled_raw,
+            expected_raw=quote.min_out,
+            decimals=quote.decimals,
+            signature=tx_id,
+            amount_usd=float(amount_usd),
+        )
         filled_qty = onchain.ui_amount(filled_raw, quote.decimals)
         fill_price = float(amount_usd) / filled_qty
         self._credit(mint, filled_raw, quote.decimals, fill_price, float(amount_usd))
@@ -459,7 +489,15 @@ class CryptoExecutor:
         tx_id = await self._execute(mint, "sell", quote)
         after = await self._token_balance_raw(mint)
         sold_raw = before - after
-        self._assert_full_fill(sold_raw, raw, side="sell")
+        self._reconcile_fill(
+            mint=mint,
+            side="sell",
+            filled_raw=sold_raw,
+            expected_raw=raw,
+            decimals=decimals,
+            signature=tx_id,
+            amount_usd=proceeds,
+        )
         self._debit(mint, sold_raw)
         sold_qty = onchain.ui_amount(sold_raw, decimals)
         log.info("live sell %s qty=%.6f sig=%s venue=%s", mint, sold_qty, tx_id, quote.venue)
@@ -586,8 +624,13 @@ class CryptoExecutor:
             else onchain.TOKEN_PROGRAM
         )
         ixs = [onchain.create_ata_idempotent(user, user, mint, token_program)]
+        fee_recipient = self.fee_recipient_override
+        buyback = self.buyback_fee_override
         if side == "buy":
             max_cost = quote.in_amount + onchain.apply_bps(quote.in_amount, self.slippage_bps)
+            # buy_v2 reads associated_quote_user (the WSOL ATA). Native SOL in
+            # the wallet does not fund that account — wrap first.
+            ixs.extend(onchain.wrap_sol_instructions(user, max_cost))
             ixs.append(
                 onchain.pump_buy_v2_instruction(
                     mint=mint,
@@ -596,10 +639,15 @@ class CryptoExecutor:
                     max_quote_cost=max_cost,
                     creator=curve.creator,
                     base_token_program=token_program,
+                    fee_recipient=fee_recipient,
+                    buyback_fee_recipient=buyback,
                     is_mayhem_mode=curve.is_mayhem_mode,
                 )
             )
+            ixs.append(onchain.unwrap_wsol_instruction(user))
         else:
+            # Ensure a WSOL ATA exists to receive quote, then unwrap leftovers.
+            ixs.append(onchain.create_ata_idempotent(user, user, onchain.WSOL_MINT))
             ixs.append(
                 onchain.pump_sell_v2_instruction(
                     mint=mint,
@@ -608,9 +656,12 @@ class CryptoExecutor:
                     min_quote_out=quote.min_out,
                     creator=curve.creator,
                     base_token_program=token_program,
+                    fee_recipient=fee_recipient,
+                    buyback_fee_recipient=buyback,
                     is_mayhem_mode=curve.is_mayhem_mode,
                 )
             )
+            ixs.append(onchain.unwrap_wsol_instruction(user))
         return ixs
 
     async def _jupiter_instructions(self, quote: _Quote) -> list[Any]:
@@ -714,14 +765,81 @@ class CryptoExecutor:
             f"signature {signature} did not confirm within {self.confirm_timeout:.1f}s ({last_err})",
         )
 
-    def _assert_full_fill(self, filled_raw: int, expected_raw: int, side: str) -> None:
-        if filled_raw <= 0:
-            raise ExecutionFailed("zero_fill", f"{side} confirmed but wallet delta is 0")
-        if filled_raw < expected_raw:
-            raise ExecutionFailed(
-                "partial_fill",
-                f"{side} filled {filled_raw} raw, expected at least {expected_raw}",
-            )
+    def _record_stranded(
+        self,
+        *,
+        mint: str,
+        side: str,
+        signature: str,
+        raw_amount: int,
+        decimals: int,
+        expected_raw: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        payload = {
+            "market": Market.CRYPTO.value,
+            "mint": mint,
+            "side": side,
+            "signature": signature,
+            "raw_amount": int(raw_amount),
+            "decimals": int(decimals),
+            "expected_raw": int(expected_raw),
+            "quantity": onchain.ui_amount(raw_amount, decimals) if raw_amount > 0 else 0.0,
+            "reason": reason,
+        }
+        if self.event_log is not None and hasattr(self.event_log, "write"):
+            self.event_log.write("stranded", **payload)
+        log.warning(
+            "stranded inventory mint=%s side=%s raw=%s expected=%s sig=%s",
+            mint,
+            side,
+            raw_amount,
+            expected_raw,
+            signature,
+        )
+        return payload
+
+    def _reconcile_fill(
+        self,
+        *,
+        mint: str,
+        side: str,
+        filled_raw: int,
+        expected_raw: int,
+        decimals: int,
+        signature: str,
+        amount_usd: float,
+    ) -> None:
+        """After confirm: credit whatever landed, then fail if it was not full.
+
+        Fail-closed for risk (the exception still denies a success fill) but
+        never leave wallet tokens invisible to `get_positions`.
+        """
+        if filled_raw >= expected_raw and filled_raw > 0:
+            return
+        reason = "zero_fill" if filled_raw <= 0 else "partial_fill"
+        if filled_raw > 0:
+            qty = onchain.ui_amount(filled_raw, decimals)
+            price = (amount_usd / qty) if qty else 0.0
+            if side == "buy":
+                # Assume the quoted USD left the wallet even if tokens fell short.
+                self._credit(mint, filled_raw, decimals, price, amount_usd)
+            else:
+                self._debit(mint, filled_raw)
+        stranded = self._record_stranded(
+            mint=mint,
+            side=side,
+            signature=signature,
+            raw_amount=max(0, filled_raw),
+            decimals=decimals,
+            expected_raw=expected_raw,
+            reason=reason,
+        )
+        raise ExecutionFailed(
+            reason,
+            f"{side} filled {filled_raw} raw, expected at least {expected_raw}",
+            stranded=stranded,
+        )
 
     # -- balances / book -----------------------------------------------------------
 
@@ -866,6 +984,8 @@ class CryptoExecutor:
             if not key:
                 continue
             if record.get("type") == "buy":
+                still[key] = True
+            elif record.get("type") == "stranded" and int(record.get("raw_amount") or 0) > 0:
                 still[key] = True
             elif record.get("type") == "close":
                 still.pop(key, None)

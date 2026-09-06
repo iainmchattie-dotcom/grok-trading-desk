@@ -81,6 +81,26 @@ class EventLog:
             "allocation", crypto_pct=crypto_pct, stocks_pct=stocks_pct, reason=reason
         )
 
+    def stranded(
+        self,
+        market: str,
+        mint: str,
+        side: str,
+        signature: str,
+        raw_amount: int,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """A confirmed tx that did not fill in full. Inventory must stay visible."""
+        return self.write(
+            "stranded",
+            market=market,
+            mint=mint,
+            side=side,
+            signature=signature,
+            raw_amount=raw_amount,
+            **extra,
+        )
+
     # -- reading back ----------------------------------------------------------------
 
     def read(self) -> list[dict[str, Any]]:

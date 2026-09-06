@@ -313,6 +313,7 @@ One JSONL line per event, append-only, never rewritten. Five record types:
 | `close` | market, symbol, pnl, hold_time |
 | `action` | symbol, action (HOLD/TIGHTEN/TRIM/CLOSE), reason |
 | `allocation` | crypto_pct, stocks_pct, reason |
+| `stranded` | mint, side, signature, raw_amount — confirmed swap that did not fill in full |
 | `cost` | cumulative calls, spend, cache hit rate, sources, per-agent |
 
 Broker refusals get their own skip reasons rather than a generic failure:

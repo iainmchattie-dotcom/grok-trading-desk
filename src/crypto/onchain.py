@@ -322,6 +322,109 @@ def create_ata_idempotent(payer: str, owner: str, mint: str, token_program: str 
     )
 
 
+# SPL Token instruction tags. SyncNative is how wrapped-SOL balance tracks lamports.
+_TOKEN_SYNC_NATIVE = 17
+_TOKEN_CLOSE_ACCOUNT = 9
+
+
+def select_recipient(mint: str, pool: tuple[str, ...] | list[str], salt: str = "") -> str:
+    """Stable pick from a recipient pool, keyed by mint (and optional salt).
+
+    Rotates load across the documented pump.fun fee accounts instead of always
+    hitting index 0. The same mint always maps to the same recipient so a
+    retry does not hop accounts mid-flight. An empty pool is a programming error.
+    """
+    if not pool:
+        raise ValueError("fee recipient pool is empty")
+    digest = hashlib.sha256(f"{mint}:{salt}".encode()).digest()
+    return pool[int.from_bytes(digest[:8], "little") % len(pool)]
+
+
+def select_pump_fee_recipients(
+    mint: str,
+    *,
+    is_mayhem_mode: bool = False,
+    fee_recipient: str | None = None,
+    buyback_fee_recipient: str | None = None,
+) -> tuple[str, str]:
+    """Fee + buyback recipients: config override, else mint-hash rotation."""
+    fee_pool = PUMP_MAYHEM_FEE_RECIPIENTS if is_mayhem_mode else PUMP_FEE_RECIPIENTS
+    fee = fee_recipient or select_recipient(mint, fee_pool, salt="fee")
+    buyback = buyback_fee_recipient or select_recipient(
+        mint, PUMP_BUYBACK_FEE_RECIPIENTS, salt="buyback"
+    )
+    return fee, buyback
+
+
+def sync_native(account: str, token_program: str = TOKEN_PROGRAM):
+    """SPL `SyncNative` — refresh a WSOL ATA after a lamport transfer."""
+    from solders.instruction import AccountMeta, Instruction
+    from solders.pubkey import Pubkey
+
+    return Instruction(
+        Pubkey.from_string(token_program),
+        bytes([_TOKEN_SYNC_NATIVE]),
+        [AccountMeta(Pubkey.from_string(str(account)), False, True)],
+    )
+
+
+def close_token_account(
+    account: str,
+    destination: str,
+    owner: str,
+    token_program: str = TOKEN_PROGRAM,
+):
+    """Close a token account, sending leftover lamports to `destination`.
+
+    For the native mint this unwraps remaining WSOL. Regular SPL accounts
+    must already be empty.
+    """
+    from solders.instruction import AccountMeta, Instruction
+    from solders.pubkey import Pubkey
+
+    return Instruction(
+        Pubkey.from_string(token_program),
+        bytes([_TOKEN_CLOSE_ACCOUNT]),
+        [
+            AccountMeta(Pubkey.from_string(str(account)), False, True),
+            AccountMeta(Pubkey.from_string(destination), False, True),
+            AccountMeta(Pubkey.from_string(owner), True, False),
+        ],
+    )
+
+
+def wrap_sol_instructions(owner: str, lamports: int) -> list:
+    """Create the user's WSOL ATA if needed, fund it, then SyncNative.
+
+    buy_v2's `associated_quote_user` is the WSOL ATA. Native SOL sitting in
+    the wallet does not fund that account; without this wrap the buy ix
+    sees an empty quote ATA and fails or takes nothing.
+    """
+    from solders.pubkey import Pubkey
+    from solders.system_program import TransferParams, transfer
+
+    if lamports <= 0:
+        raise ValueError("wrap requires a positive lamport amount")
+    wsol_ata = associated_token_address(owner, WSOL_MINT, TOKEN_PROGRAM)
+    return [
+        create_ata_idempotent(owner, owner, WSOL_MINT, TOKEN_PROGRAM),
+        transfer(
+            TransferParams(
+                from_pubkey=Pubkey.from_string(owner),
+                to_pubkey=wsol_ata,
+                lamports=int(lamports),
+            )
+        ),
+        sync_native(str(wsol_ata)),
+    ]
+
+
+def unwrap_wsol_instruction(owner: str):
+    """Close the user's WSOL ATA, returning leftover SOL to the wallet."""
+    wsol_ata = associated_token_address(owner, WSOL_MINT, TOKEN_PROGRAM)
+    return close_token_account(str(wsol_ata), owner, owner)
+
+
 def _meta(address: str, signer: bool = False, writable: bool = False):
     from solders.instruction import AccountMeta
     from solders.pubkey import Pubkey
@@ -339,8 +442,8 @@ def pump_buy_v2_instruction(
     base_token_program: str = TOKEN_PROGRAM,
     quote_mint: str = WSOL_MINT,
     quote_token_program: str = TOKEN_PROGRAM,
-    fee_recipient: str = PUMP_FEE_RECIPIENTS[0],
-    buyback_fee_recipient: str = PUMP_BUYBACK_FEE_RECIPIENTS[0],
+    fee_recipient: str | None = None,
+    buyback_fee_recipient: str | None = None,
     is_mayhem_mode: bool = False,
 ):
     """Build a `buy_v2` instruction (pump-public-docs, 2026 account list)."""
@@ -350,8 +453,12 @@ def pump_buy_v2_instruction(
     if amount <= 0 or max_quote_cost <= 0:
         raise ValueError("buy_v2 requires positive amount and max_quote_cost")
 
-    if is_mayhem_mode:
-        fee_recipient = PUMP_MAYHEM_FEE_RECIPIENTS[0]
+    fee_recipient, buyback_fee_recipient = select_pump_fee_recipients(
+        mint,
+        is_mayhem_mode=is_mayhem_mode,
+        fee_recipient=fee_recipient,
+        buyback_fee_recipient=buyback_fee_recipient,
+    )
 
     curve = bonding_curve_pda(mint)
     creator_vault = creator_vault_pda(creator)
@@ -404,8 +511,8 @@ def pump_sell_v2_instruction(
     base_token_program: str = TOKEN_PROGRAM,
     quote_mint: str = WSOL_MINT,
     quote_token_program: str = TOKEN_PROGRAM,
-    fee_recipient: str = PUMP_FEE_RECIPIENTS[0],
-    buyback_fee_recipient: str = PUMP_BUYBACK_FEE_RECIPIENTS[0],
+    fee_recipient: str | None = None,
+    buyback_fee_recipient: str | None = None,
     is_mayhem_mode: bool = False,
 ):
     """Build a `sell_v2` instruction. `amount` is raw token units (mint decimals)."""
@@ -415,8 +522,12 @@ def pump_sell_v2_instruction(
     if amount <= 0:
         raise ValueError("sell_v2 requires a positive raw token amount")
 
-    if is_mayhem_mode:
-        fee_recipient = PUMP_MAYHEM_FEE_RECIPIENTS[0]
+    fee_recipient, buyback_fee_recipient = select_pump_fee_recipients(
+        mint,
+        is_mayhem_mode=is_mayhem_mode,
+        fee_recipient=fee_recipient,
+        buyback_fee_recipient=buyback_fee_recipient,
+    )
 
     curve = bonding_curve_pda(mint)
     creator_vault = creator_vault_pda(creator)

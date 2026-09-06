@@ -214,9 +214,40 @@ class TradingDesk:
             try:
                 fill = await self.crypto_executor.buy(token.mint, amount)
             except ExecutionFailed as rejection:
-                self.log.skip(Market.CRYPTO.value, token.symbol or token.mint,
-                              rejection.reason, rejection.detail)
-                return {"bought": False, "reason": rejection.reason}
+                stranded = getattr(rejection, "stranded", None) or {}
+                self.log.skip(
+                    Market.CRYPTO.value,
+                    token.symbol or token.mint,
+                    rejection.reason,
+                    {"detail": rejection.detail, "stranded": stranded},
+                )
+                # Fail-closed for sizing: SOL likely left the wallet. Surface
+                # any tokens that landed so they are not invisible orphans.
+                qty = float(stranded.get("quantity") or 0)
+                if qty > 0 and stranded.get("side") == "buy":
+                    self.risk.record_fill(Market.CRYPTO, amount)
+                    self.positions.append(
+                        Position(
+                            market=Market.CRYPTO,
+                            symbol=token.symbol or token.mint,
+                            quantity=qty,
+                            entry_price=amount / qty,
+                            current_price=amount / qty,
+                            amount_usd=amount,
+                            score=verdict["score"],
+                            meta={
+                                "mint": token.mint,
+                                "tx_id": stranded.get("signature", ""),
+                                "stranded": True,
+                                "raw_amount": stranded.get("raw_amount", 0),
+                            },
+                        )
+                    )
+                return {
+                    "bought": False,
+                    "reason": rejection.reason,
+                    "stranded": stranded,
+                }
             except NotImplementedError as exc:
                 self.log.skip(Market.CRYPTO.value, token.symbol or token.mint,
                               "executor_not_implemented", str(exc))
@@ -588,12 +619,17 @@ class TradingDesk:
             self.analyst.live_search,
         )
         log.info("outcome memory: %d closed trades loaded", self.refresh_memory())
-        await asyncio.gather(
-            self.crypto_loop(),
-            self.stock_loop(),
-            self.exit_loop(),
-            self.allocator_loop(),
-        )
+        try:
+            await asyncio.gather(
+                self.crypto_loop(),
+                self.stock_loop(),
+                self.exit_loop(),
+                self.allocator_loop(),
+            )
+        finally:
+            closer = getattr(self.crypto_executor, "aclose", None)
+            if closer is not None:
+                await closer()
 
 
 def main() -> None:
