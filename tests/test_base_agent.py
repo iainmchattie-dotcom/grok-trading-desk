@@ -113,6 +113,42 @@ def test_insider_whitelists_primary_filing_sources():
     assert len(web["filters"]["allowed_domains"]) <= 5   # API caps the whitelist at 5
 
 
+def test_responses_bodies_use_text_format_not_response_format():
+    # Live 400: response_format exists on chat/completions only.
+    cases = (
+        (CryptoPulse(CONFIG), None),
+        (MarketPulse(CONFIG), None),
+        (Radar(CONFIG), {"symbol": "ACME"}),
+        (Auditor(CONFIG), {"mint": "M"}),
+    )
+    for agent, payload in cases:
+        body = agent.build_request(payload)
+        assert body.get("tools")
+        assert agent.request_url(body).endswith("/responses")
+        assert "response_format" not in body
+        fmt = body["text"]["format"]
+        assert fmt["type"] == "json_schema"
+        assert fmt["name"] == agent.name
+        assert fmt["strict"] is True
+        assert fmt["schema"] == agent.SCHEMA
+        assert "json_schema" not in fmt
+
+
+def test_responses_json_object_when_structured_outputs_is_off():
+    config = {"grok": {**CONFIG["grok"], "structured_outputs": False}}
+    body = CryptoPulse(config).build_request(None)
+    assert "response_format" not in body
+    assert body["text"]["format"] == {"type": "json_object"}
+
+
+def test_allocator_keeps_response_format_on_chat_completions():
+    body = Allocator(CONFIG).build_request({})
+    assert "tools" not in body
+    assert "text" not in body
+    assert body["response_format"]["type"] == "json_schema"
+    assert Allocator(CONFIG).request_url(body).endswith("/chat/completions")
+
+
 def test_agents_that_need_no_retrieval_stay_on_chat_completions():
     alloc = Allocator(CONFIG)
     body = alloc.build_request({})

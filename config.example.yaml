@@ -15,7 +15,7 @@ grok:
   reasoning_effort:
     # Only grok-4.3 accepts this parameter: none | low | medium | high.
     fast: "none"
-  structured_outputs: true    # response_format json_schema, strict
+  structured_outputs: true    # chat: response_format; Responses: text.format
   # Agent Tools (web_search / x_search) on /v1/responses. The old Live Search
   # field `search_parameters` on /v1/chat/completions is retired (HTTP 410).
   # Set false to skip retrieval; models then answer from the training cutoff.

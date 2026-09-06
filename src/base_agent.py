@@ -7,8 +7,9 @@ sees a raised exception from an agent.
 
 Three things here come straight from the upstream docs (see RESEARCH.md):
 
-* `response_format: json_schema` with `strict: true` makes the model return the
-  shape we asked for, so parsing is no longer the weak link.
+* Structured outputs: chat/completions uses `response_format` (`json_schema`,
+  `strict: true`). `/v1/responses` rejects that field (HTTP 400) and wants
+  `text.format` instead — same schema, flattened `{type, name, schema, strict}`.
 * Live Search (`search_parameters` on `/v1/chat/completions`) was retired and
   now returns HTTP 410 Gone. Agents that need current data send `web_search` /
   `x_search` tools on `/v1/responses` instead. `grok.live_search: false` skips
@@ -507,6 +508,37 @@ class GrokAgent:
 
     # -- request assembly ---------------------------------------------------------
 
+    def output_format(self, *, responses: bool) -> dict[str, Any]:
+        """Structured-output field for the endpoint this request will hit.
+
+        Chat/completions: `response_format` (`json_schema` nested under
+        `json_schema`, or `json_object`).
+        Responses: `text.format` (flattened `{type, name, schema, strict}`),
+        per docs.x.ai structured-outputs + the live 400 that rejects
+        `response_format` on `/v1/responses`.
+        """
+        if self.structured_outputs and self.SCHEMA is not None:
+            if responses:
+                return {
+                    "text": {
+                        "format": {
+                            "type": "json_schema",
+                            "name": self.name,
+                            "schema": self.SCHEMA,
+                            "strict": True,
+                        }
+                    }
+                }
+            return {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": self.name, "schema": self.SCHEMA, "strict": True},
+                }
+            }
+        if responses:
+            return {"text": {"format": {"type": "json_object"}}}
+        return {"response_format": {"type": "json_object"}}
+
     def build_request(self, payload: Any) -> dict[str, Any]:
         messages = self.build_messages(payload)
         body: dict[str, Any] = {
@@ -516,14 +548,6 @@ class GrokAgent:
             "prompt_cache_key": f"grok-desk:{self.name}",
         }
 
-        if self.structured_outputs and self.SCHEMA is not None:
-            body["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {"name": self.name, "schema": self.SCHEMA, "strict": True},
-            }
-        else:
-            body["response_format"] = {"type": "json_object"}
-
         # reasoning_effort is a grok-4.3-only parameter; sending it elsewhere errors.
         if self.reasoning_effort and self.model.startswith("grok-4.3"):
             body["reasoning_effort"] = self.reasoning_effort
@@ -532,10 +556,13 @@ class GrokAgent:
         if tools:
             # Responses API: tools run server-side. Never send search_parameters;
             # that field is retired and the chat/completions endpoint returns 410.
+            # Never send response_format here — xAI 400s it; use text.format.
+            body.update(self.output_format(responses=True))
             body["input"] = messages
             body["tools"] = tools
             body["store"] = False
         else:
+            body.update(self.output_format(responses=False))
             body["messages"] = messages
 
         return body

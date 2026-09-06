@@ -105,7 +105,22 @@ are logged with the decision.
 ### Structured outputs
 
 `response_format: {"type": "json_schema", "json_schema": {"name", "schema",
-"strict": true}}` is supported on `/v1/chat/completions`. Notes from the docs:
+"strict": true}}` is supported on `/v1/chat/completions` **only**. A live
+dry-run (2026-09-06) showed `/v1/responses` rejecting it with HTTP 400:
+
+> `'response_format' is not supported on /v1/responses — use 'text.format'`
+
+The Responses shape, from the official structured-outputs guide (OpenAI SDK
+example with `web_search` tools), is flattened:
+
+```
+text: { format: { type: "json_schema", name, schema, strict: true } }
+```
+
+`json_object` becomes `text: { format: { type: "json_object" } }`. Retrieval
+agents use that; the allocator (no tools) keeps `response_format`.
+
+Notes from the docs:
 
 - `additionalProperties` must be explicitly `false`
 - Draft 2020-12 preferred; `minLength`/`maxLength` enforced up to 2048,
