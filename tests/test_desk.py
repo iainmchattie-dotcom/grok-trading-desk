@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import pytest
 import yaml
 
-from tests.conftest import FakeClient
+from tests.conftest import FakeClient, request_user_content
 from src.desk import TradingDesk
 from src.models import Market, Position, Stock, Token
 from src.stocks.stock_executor import OrderRejected, classify_rejection
@@ -188,7 +188,7 @@ async def test_past_outcomes_reach_the_checker_prompt(tmp_path):
     desk.refresh_memory()
 
     await desk.evaluate_token(TOKEN)
-    sent = desk.crypto_checker._client.calls[0]["json"]["messages"][1]["content"]
+    sent = request_user_content(desk.crypto_checker._client.calls[0]["json"])
     assert "past_outcomes" in sent and "PUPPY" in sent
 
 

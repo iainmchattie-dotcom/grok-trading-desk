@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from tests.conftest import CONFIG
+from tests.conftest import CONFIG, request_user_content
 from src.models import ExitAction, Market, Position
 from src.shared.exit_manager import ExitManager
 
@@ -69,7 +69,7 @@ async def test_out_of_range_fractions_are_replaced_with_defaults(client_factory)
 async def test_prompt_carries_the_position_state(client_factory):
     client = client_factory({"action": "HOLD"})
     await ExitManager(CONFIG, client=client).run(POSITION)
-    sent = client.calls[0]["json"]["messages"][1]["content"]
+    sent = request_user_content(client.calls[0]["json"])
     assert "ACME" in sent and "pnl_pct" in sent and "hold_time_hours" in sent
 
 

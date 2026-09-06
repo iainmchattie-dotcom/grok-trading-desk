@@ -96,6 +96,12 @@ def no_sleep(monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", instant)
 
 
+def request_user_content(body: dict[str, Any]) -> str:
+    """User-turn JSON from a chat/completions (`messages`) or Responses (`input`) body."""
+    turns = body.get("messages") or body.get("input") or []
+    return turns[1]["content"]
+
+
 CONFIG: dict[str, Any] = {
     "grok": {
         "api_key": "test-key",
