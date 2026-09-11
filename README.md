@@ -4,10 +4,12 @@ A two-market trading system: twelve bots covering Solana memecoins (pump.fun) an
 US equities (Alpaca), orchestrated by Grok. Two of the twelve are pure code; the
 other ten are LLM agents with a strict JSON contract and a pessimistic fallback.
 
-The design principle throughout: **a model that fails is a model that says no.**
-An unparseable audit vetoes the buy. An unreachable checker rejects. A broken exit
-manager holds. A dead allocator returns 50/50. Nothing about a failure looks like
-permission.
+The design principle throughout: **a model that fails is a model that says no —
+except where that rule made the paper book untradeable.** An unparseable audit
+still vetoes. A broken exit manager still holds. A dead allocator still returns
+50/50. An unreachable *crypto checker* still fail-closes **live**, but on paper
+it is a size penalty rather than a skip: otherwise the desk never fills, and
+there is nothing to learn from.
 
 Every agent answers under a strict JSON schema, reads live web/X/news data
 through xAI Agent Tools (`web_search` / `x_search` on `/v1/responses`), and
@@ -88,7 +90,8 @@ The feed does not actually ship a funding graph or holder census — only
 watch-window trades — so the prompt treats clustered early buys as normal and
 refuses to invent a ring when the tape is thin. Wash trading and an unreadable
 audit are hard vetoes. Coordinated buys is a hard veto only when the tape
-corroborates a ring; an isolated flag becomes a score penalty. Parse/API
+shows a small repeat-buyer set (or measured concentration); an isolated flag
+becomes a score penalty. Parse/API
 failure still returns `true` for both flags plus `audit_unavailable`.
 
 **3 · narrative** (`crypto/narrative.py`) — Rates meme potential: is
@@ -136,12 +139,13 @@ code, so a runaway model cannot put the whole book on one side. Failure returns
 50/50 — no tilt.
 
 **11 · crypto_checker** (`crypto/crypto_checker.py`, **deep model**) — The adversarial
-gate before money moves. Told explicitly to argue the other side and find the way
-this loses: the rug the audit missed, concentration that dumps on the buy, an
-exhausted narrative, liquidity too thin to exit. Approves only when it cannot
-construct a plausible loss. Runs the stronger model, because check quality *is*
-the safety — and it runs its own searches rather than trusting the generators'
-summary of the evidence.
+gate before money moves. Argues the other side (rug the audit missed, dump
+concentration, exhausted narrative, thin liquidity) and splits the verdict:
+`hard_reject` is reserved for evidence of an unsurvivable trap; anything else is
+advisory. Paper trading only skips on `hard_reject`. An unreachable checker
+(`checker_unavailable`) does not block paper fills — it penalises the size
+instead. Live still fail-closes on any non-approve. Runs the stronger model and
+its own searches rather than trusting the generators' summary of the evidence.
 
 **12 · stock_checker** (`stocks/stock_checker.py`, **deep model**) — Same job on the
 equity side: the move is already exhausted, the catalyst is priced in, the gap
@@ -313,10 +317,14 @@ reporting a misleading 0% win rate.
 A prompt can be argued with. These cannot:
 
 - **Crypto** — `wash_trading` → skip, before any scoring. `coordinated_buys` →
-  skip only when the watch-window tape corroborates a ring (few wallets, many
-  buys) or the flag is backed by measured holder/dev concentration. An LLM flag
-  on thin or ambiguous data is a score penalty, not a skip. An unreadable audit
-  (`audit_unavailable`) still vetoes.
+  skip only when the watch-window tape shows a *small* repeat-buyer set (few
+  unique traders, many buys) or the flag is backed by measured holder/dev
+  concentration. Repeat buys from a large trader set are dip-buying, not a ring.
+  An LLM flag on thin or ambiguous data is a score penalty, not a skip. An
+  unreadable audit (`audit_unavailable`) still vetoes. On **paper**, the
+  adversarial checker only skips evidence-based `hard_reject` (honeypot / rug /
+  wash / hostile mint). `checker_unavailable` and soft rejects are a score
+  penalty, not a skip. Live still fail-closes on any checker non-approve.
 - **Stocks** — `controversy > 0.7` → skip. `insider_selling > 0.8` **and**
   `insider_buying < 0.2` → skip.
 - **Both** — `pulse.go_signal < 0.3` → that entire market pauses.

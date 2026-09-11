@@ -133,6 +133,93 @@ def test_crypto_unmeasured_token_does_not_invent_a_ring():
     assert cs.hard_veto({**CLEAN_AUDIT, "coordinated_buys": True}, OPEN_PULSE, token=empty) is None
 
 
+def test_crypto_busy_organic_tape_is_not_a_structural_ring():
+    """25 unique traders who each bought a few times is dip-buying, not a 4-wallet ring.
+
+    Tokens that already cleared scout min_holders were still eating
+    veto_coordinated_buys because unique_traders/buys <= 0.40.
+    """
+    busy = TOKEN.model_copy(update={"holders": 25, "unique_traders": 25, "buys": 80, "sells": 10})
+    clean = cs.score_token(busy, CLEAN_AUDIT, STRONG_NARRATIVE, OPEN_PULSE)
+    assert clean["vetoed"] is False
+    assert clean["manipulation_evidence"]["strength"] == "none"
+    assert "repeat_buyers" not in clean["manipulation_evidence"]["signals"]
+
+    flagged = cs.score_token(
+        busy, {**CLEAN_AUDIT, "coordinated_buys": True}, STRONG_NARRATIVE, OPEN_PULSE
+    )
+    assert flagged["vetoed"] is False
+    assert flagged["buy"] is True
+    assert flagged["manipulation_evidence"]["strength"] == "weak"
+
+
+def test_crypto_small_repeat_buyer_set_is_still_a_hard_veto():
+    result = cs.score_token(RING_TOKEN, CLEAN_AUDIT, STRONG_NARRATIVE, OPEN_PULSE)
+    assert result["reason"] == "veto_coordinated_buys"
+    assert result["manipulation_evidence"]["trader_count"] <= cs.MAX_TRADERS_FOR_STRUCTURAL_RING
+
+
+def test_paper_checker_unavailable_does_not_block():
+    check = {
+        "approve": False,
+        "hard_reject": False,
+        "kill_reasons": ["checker_unavailable"],
+        "adjusted_score": 0.0,
+    }
+    gate = cs.apply_crypto_checker(check, paper=True, matrix_score=0.70)
+    assert gate["allow"] is True
+    assert gate["unavailable"] is True
+    assert gate["advisory"] is True
+    assert gate["score"] == pytest.approx(0.70 - cs.CHECKER_UNAVAILABLE_PENALTY)
+
+
+def test_paper_soft_checker_reject_does_not_block():
+    check = {
+        "approve": False,
+        "hard_reject": False,
+        "kill_reasons": ["liquidity too thin"],
+        "adjusted_score": 0.0,
+    }
+    gate = cs.apply_crypto_checker(check, paper=True, matrix_score=0.70)
+    assert gate["allow"] is True
+    assert gate["advisory"] is True
+    assert gate["score"] == pytest.approx(0.70 - cs.CHECKER_SOFT_REJECT_PENALTY)
+
+
+def test_paper_hard_reject_still_blocks():
+    check = {
+        "approve": False,
+        "hard_reject": True,
+        "kill_reasons": ["honeypot"],
+        "adjusted_score": 0.0,
+    }
+    gate = cs.apply_crypto_checker(check, paper=True, matrix_score=0.90)
+    assert gate["allow"] is False
+    assert gate["reason"] == "checker_rejected"
+
+
+def test_paper_hard_reject_from_kill_reason_text():
+    check = {
+        "approve": False,
+        "hard_reject": False,
+        "kill_reasons": ["mint authority retained by deployer"],
+        "adjusted_score": 0.0,
+    }
+    assert cs.apply_crypto_checker(check, paper=True, matrix_score=0.80)["allow"] is False
+
+
+def test_live_checker_unavailable_still_blocks():
+    check = {
+        "approve": False,
+        "hard_reject": False,
+        "kill_reasons": ["checker_unavailable"],
+        "adjusted_score": 0.0,
+    }
+    gate = cs.apply_crypto_checker(check, paper=False, matrix_score=0.90)
+    assert gate["allow"] is False
+    assert gate["reason"] == "checker_rejected"
+
+
 def test_crypto_derivative_narrative_is_discounted():
     original = cs.narrative_score(STRONG_NARRATIVE)
     copy = cs.narrative_score({**STRONG_NARRATIVE, "is_derivative": True})

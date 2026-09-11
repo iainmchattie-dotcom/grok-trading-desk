@@ -103,9 +103,54 @@ async def test_a_paused_crypto_market_blocks_everything(tmp_path):
 
 
 async def test_the_checker_can_veto_a_high_scoring_token(tmp_path):
-    desk = build(tmp_path, {"crypto_checker": {"approve": False, "confidence": 0.9,
-                                               "kill_reasons": ["liquidity too thin"]}})
+    """Evidence-based scam still skips on paper. Soft rejects do not."""
+    desk = build(tmp_path, {"crypto_checker": {
+        "approve": False, "hard_reject": True, "confidence": 0.9,
+        "kill_reasons": ["honeypot"],
+    }})
     assert (await desk.evaluate_token(TOKEN))["reason"] == "checker_rejected"
+
+
+async def test_checker_unavailable_does_not_block_an_above_threshold_paper_buy(tmp_path, no_sleep):
+    desk = build(tmp_path)
+    desk.crypto_checker._client = FakeClient(["{oops"])
+    result = await desk.evaluate_token(TOKEN)
+    assert result["bought"] is True
+    records = [json.loads(line) for line in open(tmp_path / "desk.jsonl")]
+    buy = records[-1]
+    assert buy["type"] == "buy"
+    assert buy["all_agent_scores"]["checker"]["kill_reasons"] == ["checker_unavailable"]
+    assert buy["all_agent_scores"]["checker_gate"]["allow"] is True
+    assert buy["all_agent_scores"]["checker_gate"]["unavailable"] is True
+
+
+async def test_soft_checker_reject_does_not_block_paper_buy(tmp_path):
+    desk = build(tmp_path, {"crypto_checker": {
+        "approve": False, "hard_reject": False, "confidence": 0.7,
+        "kill_reasons": ["liquidity too thin"], "adjusted_score": 0.0,
+    }})
+    result = await desk.evaluate_token(TOKEN)
+    assert result["bought"] is True
+    records = [json.loads(line) for line in open(tmp_path / "desk.jsonl")]
+    buy = records[-1]
+    assert buy["type"] == "buy"
+    assert buy["all_agent_scores"]["checker_gate"]["advisory"] is True
+
+
+async def test_live_checker_unavailable_still_fail_closes(tmp_path, no_sleep):
+    config = yaml.safe_load(open("config.example.yaml"))
+    config["mode"] = "live"
+    config["logging"] = {"path": str(tmp_path / "desk.jsonl"), "echo_stdout": False,
+                         "cost_report_every": 0}
+    desk = TradingDesk(config, dry_run=True, live_ack=True)
+    replies = {**GOOD}
+    for name, reply in replies.items():
+        getattr(desk, name)._client = FakeClient([reply])
+    desk.crypto_checker._client = FakeClient(["{oops"])
+    assert desk.crypto_executor.paper is False
+    result = await desk.evaluate_token(TOKEN)
+    assert result["bought"] is False
+    assert result["reason"] == "checker_rejected"
 
 
 # --- stock path -------------------------------------------------------------------

@@ -144,13 +144,22 @@ async def test_crypto_checker_uses_the_deep_model(client_factory):
 async def test_crypto_checker_rejects_on_failure(client_factory, no_sleep):
     result = await CryptoChecker(CONFIG, client=client_factory("{oops")).run({"symbol": "WIF2"})
     assert result["approve"] is False
+    assert result["hard_reject"] is False
     assert result["adjusted_score"] == 0.0
     assert result["kill_reasons"] == ["checker_unavailable"]
+
+
+def test_crypto_checker_prompt_reserves_hard_reject_for_evidence():
+    prompt = CryptoChecker.PROMPT.lower()
+    assert "hard_reject" in prompt
+    assert "honeypot" in prompt
+    assert "advisory" in prompt or "soft reject" in prompt
 
 
 async def test_crypto_checker_defaults_missing_approve_to_false(client_factory):
     result = await CryptoChecker(CONFIG, client=client_factory({"confidence": 0.9})).run({})
     assert result["approve"] is False
+    assert result["hard_reject"] is False
 
 
 async def test_crypto_pulse_caches_within_window(client_factory):
