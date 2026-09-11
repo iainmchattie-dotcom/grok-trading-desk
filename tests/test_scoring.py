@@ -4,7 +4,11 @@ from src.crypto import crypto_scoring as cs
 from src.models import Stock, Token
 from src.stocks import stock_scoring as ss
 
-TOKEN = Token(mint="M", symbol="X", holders=300, buys=90, sells=30, liquidity_usd=100_000)
+TOKEN = Token(mint="M", symbol="X", holders=300, unique_traders=90, buys=90, sells=30, liquidity_usd=100_000)
+# Few wallets, many buys: the structural ring the watch window can actually see.
+RING_TOKEN = Token(mint="M", symbol="X", holders=4, unique_traders=4, buys=20, sells=1, liquidity_usd=100_000)
+# Short window, no holder census — the production pump.fun shape.
+THIN_TOKEN = Token(mint="M", symbol="X", holders=14, unique_traders=14, buys=16, sells=2, liquidity_usd=20_000)
 STOCK = Stock(symbol="ACME", price=50, prev_close=46, avg_volume=2e6, volume=6e6, market_cap=5e9)
 
 CLEAN_AUDIT = {
@@ -27,12 +31,43 @@ def test_crypto_perfect_inputs_score_one_and_buy():
     assert result["vetoed"] is False
 
 
-def test_crypto_coordinated_buys_veto_beats_everything_else():
-    audit = {**CLEAN_AUDIT, "coordinated_buys": True}
-    result = cs.score_token(TOKEN, audit, STRONG_NARRATIVE, OPEN_PULSE)
+def test_crypto_coordinated_ring_vetoes_even_without_the_llm_flag():
+    result = cs.score_token(RING_TOKEN, CLEAN_AUDIT, STRONG_NARRATIVE, OPEN_PULSE)
     assert result["vetoed"] is True
     assert result["reason"] == "veto_coordinated_buys"
     assert result["score"] == 0.0 and result["buy"] is False
+    assert "repeat_buyers" in result["manipulation_evidence"]["signals"]
+
+
+def test_crypto_llm_coordinated_flag_on_organic_tape_is_not_a_hard_veto():
+    """The production failure mode: auditor says ring because early buys cluster,
+    but unique_traders ≈ buys and concentration was never measured."""
+    audit = {**CLEAN_AUDIT, "coordinated_buys": True}
+    result = cs.score_token(TOKEN, audit, STRONG_NARRATIVE, OPEN_PULSE)
+    assert result["vetoed"] is False
+    assert result["buy"] is True
+    assert result["manipulation_evidence"]["strength"] == "weak"
+    # suspicion is a real penalty, just not a skip
+    clean = cs.score_token(TOKEN, CLEAN_AUDIT, STRONG_NARRATIVE, OPEN_PULSE)
+    assert result["components"]["audit_safety"] == pytest.approx(
+        clean["components"]["audit_safety"] - cs.COORDINATED_SUSPICION_PENALTY
+    )
+
+
+def test_crypto_llm_flag_plus_measured_concentration_is_a_hard_veto():
+    concentrated = TOKEN.model_copy(update={"top10_holder_pct": 0.82})
+    audit = {**CLEAN_AUDIT, "coordinated_buys": True}
+    result = cs.score_token(concentrated, audit, STRONG_NARRATIVE, OPEN_PULSE)
+    assert result["reason"] == "veto_coordinated_buys"
+    assert "top10_concentration" in result["manipulation_evidence"]["signals"]
+
+
+def test_crypto_thin_ambiguous_data_does_not_hard_veto():
+    audit = {**CLEAN_AUDIT, "coordinated_buys": True, "safety_score": 0.7}
+    result = cs.score_token(THIN_TOKEN, audit, STRONG_NARRATIVE, OPEN_PULSE)
+    assert result["vetoed"] is False
+    assert result["manipulation_evidence"]["strength"] == "weak"
+    assert result["manipulation_evidence"]["concentration_known"] is False
 
 
 def test_crypto_wash_trading_veto():
@@ -59,6 +94,8 @@ def test_crypto_pessimistic_fallbacks_are_vetoed():
         TOKEN, Auditor({}).fallback(), Narrative({}).fallback(), CryptoPulse({}).fallback()
     )
     assert result["buy"] is False and result["vetoed"] is True
+    # Parse/API failure is its own skip reason, not a fake coordinated ring.
+    assert result["reason"] == "veto_audit_unavailable"
 
 
 def test_crypto_threshold_is_exclusive_below_inclusive_at():
@@ -76,6 +113,24 @@ def test_crypto_audit_score_penalises_snipers_and_bundling():
     assert cs.audit_score({**CLEAN_AUDIT, "sniper_pct": 0.4}) == pytest.approx(0.8)
     assert cs.audit_score({**CLEAN_AUDIT, "bundled_launch": True}) == pytest.approx(0.7)
     assert cs.audit_score({"safety_score": 0.1, "sniper_pct": 1.0}) == 0.0  # clamped, never negative
+    assert cs.audit_score(CLEAN_AUDIT, suspicion=True) == pytest.approx(1.0 - cs.COORDINATED_SUSPICION_PENALTY)
+
+
+def test_crypto_zero_holder_pct_is_unknown_not_a_ring():
+    """Token.top10_holder_pct defaults to 0.0 because the feed never sends it."""
+    evidence = cs.manipulation_evidence(THIN_TOKEN, {**CLEAN_AUDIT, "coordinated_buys": True})
+    assert evidence["concentration_known"] is False
+    assert evidence["strength"] == "weak"
+    assert cs.holder_concentration_known(THIN_TOKEN) is False
+
+
+def test_crypto_unmeasured_token_does_not_invent_a_ring():
+    # buys=0 / holders=0: not enough tape. Missing data is not coordination.
+    empty = Token(mint="M")
+    evidence = cs.manipulation_evidence(empty, {**CLEAN_AUDIT, "coordinated_buys": True})
+    assert evidence["strength"] == "weak"
+    assert evidence["diversity"] is None
+    assert cs.hard_veto({**CLEAN_AUDIT, "coordinated_buys": True}, OPEN_PULSE, token=empty) is None
 
 
 def test_crypto_derivative_narrative_is_discounted():
