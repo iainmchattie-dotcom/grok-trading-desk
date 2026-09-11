@@ -68,6 +68,35 @@ async def test_a_wash_traded_token_never_reaches_the_checker(tmp_path):
     assert desk.crypto_checker._client.calls == []   # veto is free
 
 
+async def test_uncorroborated_coordinated_flag_still_reaches_the_checker(tmp_path):
+    """Early pump.fun tapes look clustered; that LLM flag alone must not skip."""
+    desk = build(tmp_path, {"auditor": {**GOOD["auditor"], "coordinated_buys": True}})
+    result = await desk.evaluate_token(TOKEN)
+    assert result["bought"] is True
+    assert desk.crypto_checker._client.calls  # scoring ran; checker was asked
+
+
+async def test_a_repeat_buyer_ring_is_vetoed_even_if_the_auditor_is_clean(tmp_path):
+    ring = TOKEN.model_copy(update={"holders": 3, "unique_traders": 3, "buys": 18, "sells": 1})
+    desk = build(tmp_path)
+    result = await desk.evaluate_token(ring)
+    assert result["reason"] == "veto_coordinated_buys"
+    assert desk.crypto_checker._client.calls == []
+    records = [json.loads(line) for line in open(tmp_path / "desk.jsonl")]
+    skip = records[-1]
+    assert skip["type"] == "skip" and skip["reason"] == "veto_coordinated_buys"
+    assert "repeat_buyers" in skip["detail"]["manipulation_evidence"]["signals"]
+
+
+async def test_unreadable_audit_skips_as_unavailable_not_as_a_ring(tmp_path):
+    from src.crypto.auditor import Auditor
+
+    desk = build(tmp_path, {"auditor": Auditor({}).fallback()})
+    result = await desk.evaluate_token(TOKEN)
+    assert result["reason"] == "veto_audit_unavailable"
+    assert desk.crypto_checker._client.calls == []
+
+
 async def test_a_paused_crypto_market_blocks_everything(tmp_path):
     desk = build(tmp_path, {"crypto_pulse": {"regime": "risk_off", "go_signal": 0.1}})
     assert (await desk.evaluate_token(TOKEN))["reason"] == "veto_market_paused"

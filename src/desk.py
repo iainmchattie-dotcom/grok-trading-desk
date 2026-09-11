@@ -177,7 +177,9 @@ class TradingDesk:
 
         if not verdict["buy"]:
             self.log.skip(Market.CRYPTO.value, token.symbol or token.mint, verdict["reason"],
-                          {"score": verdict["score"]})
+                          {"score": verdict["score"],
+                           "components": verdict.get("components"),
+                           "manipulation_evidence": verdict.get("manipulation_evidence")})
             return {"bought": False, "reason": verdict["reason"]}
 
         check = await self.crypto_checker.run(

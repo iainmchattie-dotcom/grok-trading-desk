@@ -16,6 +16,38 @@ TOKEN = Token(
 )
 
 
+def test_auditor_prompt_does_not_assume_manipulation_on_ambiguity():
+    prompt = Auditor.PROMPT.lower()
+    assert "assume manipulation" not in prompt
+    assert "ambiguity is not proof of manipulation" in prompt
+    assert "temporal clustering of independent buys is not" in prompt
+
+
+def test_auditor_facts_mark_unmeasured_concentration_as_unknown():
+    facts = Auditor({}).facts(TOKEN)
+    assert facts["holder_concentration_known"] is False
+    assert facts["dev_holding_known"] is False
+    assert facts["top10_holder_pct"] is None
+    assert facts["dev_holding_pct"] is None
+    assert facts["unique_traders_per_buy"] is None or facts["unique_traders_per_buy"] > 0.4
+    assert any("unknown when null" in note for note in facts["data_limitations"])
+
+
+def test_auditor_facts_include_diversity_when_buys_exist():
+    token = TOKEN.model_copy(update={"buys": 20, "unique_traders": 18, "holders": 18})
+    facts = Auditor({}).facts(token)
+    assert facts["unique_traders_per_buy"] == 0.9
+    assert facts["holder_concentration_known"] is False
+
+
+def test_auditor_fallback_is_marked_unavailable():
+    fallback = Auditor({}).fallback()
+    assert fallback["audit_unavailable"] is True
+    assert "audit_unavailable" in fallback["red_flags"]
+    assert fallback["coordinated_buys"] is True
+    assert fallback["wash_trading"] is True
+
+
 async def test_auditor_parses_clean_audit(client_factory):
     client = client_factory(
         {
@@ -60,6 +92,7 @@ async def test_auditor_falls_back_pessimistically_on_broken_json(client_factory,
     assert result["wash_trading"] is True
     assert result["safety_score"] == 0.0
     assert result["red_flags"] == ["audit_unavailable"]
+    assert result["audit_unavailable"] is True
     assert len(client.calls) == 3  # all retries burnt before giving up
 
 

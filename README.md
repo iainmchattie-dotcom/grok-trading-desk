@@ -84,7 +84,12 @@ clients that hammer it.
 **2 · auditor** (`crypto/auditor.py`) — Audits the wallet graph behind
 a launch: coordinated buy rings funded from a common source, wash trading cycling
 the same capital, bundled supply sniped by the deployer, sniper and insider share.
-Two of its outputs are hard vetoes, so its failure mode returns `true` for both.
+The feed does not actually ship a funding graph or holder census — only
+watch-window trades — so the prompt treats clustered early buys as normal and
+refuses to invent a ring when the tape is thin. Wash trading and an unreadable
+audit are hard vetoes. Coordinated buys is a hard veto only when the tape
+corroborates a ring; an isolated flag becomes a score penalty. Parse/API
+failure still returns `true` for both flags plus `audit_unavailable`.
 
 **3 · narrative** (`crypto/narrative.py`) — Rates meme potential: is
 the reference current, is the ticker memorable, does the branding read as effort,
@@ -307,7 +312,11 @@ reporting a misleading 0% win rate.
 
 A prompt can be argued with. These cannot:
 
-- **Crypto** — `coordinated_buys` or `wash_trading` → skip, before any scoring.
+- **Crypto** — `wash_trading` → skip, before any scoring. `coordinated_buys` →
+  skip only when the watch-window tape corroborates a ring (few wallets, many
+  buys) or the flag is backed by measured holder/dev concentration. An LLM flag
+  on thin or ambiguous data is a score penalty, not a skip. An unreadable audit
+  (`audit_unavailable`) still vetoes.
 - **Stocks** — `controversy > 0.7` → skip. `insider_selling > 0.8` **and**
   `insider_buying < 0.2` → skip.
 - **Both** — `pulse.go_signal < 0.3` → that entire market pauses.
