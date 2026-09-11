@@ -2,10 +2,14 @@
 
 Hard vetoes live here, not in prompts. Wash trading still kills the candidate
 before any weighted score is computed. Coordinated-buy rings do too — but only
-when the watch-window tape (or measured holder concentration) actually looks
-like a ring. An LLM flag on thin or ambiguous data is a score penalty, not a
-skip: pump.fun's first minutes always look "clustered", and the feed does not
-ship a funding graph.
+when the watch-window tape shows a *small* repeat-buyer set, or the LLM flag is
+backed by measured holder/dev concentration. Repeat buys from a large trader
+set (the normal pump.fun dip-buy tape) are not a ring. An LLM flag on thin or
+ambiguous data is a score penalty, not a skip.
+
+The adversarial checker is also gated here. Live fail-closes on any non-approve.
+Paper only skips evidence-based hard rejects; checker_unavailable and soft
+rejects become a score penalty so an above-threshold candidate can still fill.
 """
 
 from __future__ import annotations
@@ -26,11 +30,30 @@ DEFAULT_WEIGHTS = {
 # only structural ring signal on a typical launch is "few wallets, many buys".
 MIN_BUYS_FOR_RING = 8
 STRONG_DIVERSITY_MAX = 0.40  # unique traders / buys; 12 buys from 5 wallets = 0.42
+# A 25-wallet tape that already cleared scout min_holders is dip-buying, not a
+# 4-wallet ring. Repeat buys from a large trader set must not hard-veto.
+MAX_TRADERS_FOR_STRUCTURAL_RING = 8
 STRONG_TOP10 = 0.70          # only when concentration is actually measured (> 0)
 STRONG_DEV_HOLDING = 0.25
 # LLM said ring, but the tape does not corroborate. Keeps safety in the score
 # without zeroing the whole candidate.
 COORDINATED_SUSPICION_PENALTY = 0.20
+
+# Paper checker: unavailable / soft rejects are penalties, not skips.
+CHECKER_UNAVAILABLE_PENALTY = 0.15
+CHECKER_SOFT_REJECT_PENALTY = 0.10
+# Free-text backup when the model forgets `hard_reject`. Keep this narrow —
+# the adversarial checker will say "this will rug" on almost everything.
+HARD_CHECKER_REASON_NEEDLES = (
+    "honeypot",
+    "rug pull",
+    "rugpull",
+    "rug-pull",
+    "wash trading",
+    "wash_trading",
+    "mint authority",
+    "freeze authority",
+)
 
 
 def _trader_count(token: Token) -> int:
@@ -78,7 +101,12 @@ def manipulation_evidence(token: Token | None, audit: dict[str, Any]) -> dict[st
 
     signals: list[str] = []
     diversity = trader_diversity(token)
-    if diversity is not None and diversity <= STRONG_DIVERSITY_MAX:
+    traders = _trader_count(token)
+    if (
+        diversity is not None
+        and diversity <= STRONG_DIVERSITY_MAX
+        and traders <= MAX_TRADERS_FOR_STRUCTURAL_RING
+    ):
         signals.append("repeat_buyers")
 
     concentration_known = holder_concentration_known(token)
@@ -106,7 +134,7 @@ def manipulation_evidence(token: Token | None, audit: dict[str, Any]) -> dict[st
         "signals": signals,
         "diversity": diversity,
         "concentration_known": concentration_known,
-        "trader_count": _trader_count(token),
+        "trader_count": traders,
     }
 
 
@@ -216,4 +244,92 @@ def score_token(
         "components": components,
         "threshold": threshold,
         "manipulation_evidence": evidence,
+    }
+
+
+def checker_unavailable(check: dict[str, Any]) -> bool:
+    """True when the adversarial checker never produced a real review."""
+    reasons = [str(reason).lower() for reason in (check.get("kill_reasons") or [])]
+    return any("checker_unavailable" in reason for reason in reasons)
+
+
+def checker_hard_reject(check: dict[str, Any]) -> bool:
+    """Evidence-based scam/rug/honeypot. Unavailability is not evidence."""
+    if checker_unavailable(check):
+        return False
+    if bool(check.get("hard_reject")):
+        return True
+    blob = " ".join(str(reason).lower() for reason in (check.get("kill_reasons") or []))
+    return any(needle in blob for needle in HARD_CHECKER_REASON_NEEDLES)
+
+
+def apply_crypto_checker(
+    check: dict[str, Any],
+    *,
+    paper: bool,
+    matrix_score: float,
+) -> dict[str, Any]:
+    """Turn a checker reply into allow/skip plus the score used for sizing.
+
+    Live stays fail-closed: any non-approve is a skip. Paper only hard-blocks
+    evidence-based scams; checker_unavailable and soft rejects become a
+    penalty so an otherwise above-threshold candidate can still fill.
+    """
+    unavailable = checker_unavailable(check)
+    hard = checker_hard_reject(check)
+    approved = bool(check.get("approve"))
+    score = float(matrix_score)
+    try:
+        adjusted = float(check.get("adjusted_score") or 0.0)
+    except (TypeError, ValueError):
+        adjusted = 0.0
+
+    if paper:
+        if hard:
+            return {
+                "allow": False,
+                "reason": "checker_rejected",
+                "score": 0.0,
+                "advisory": False,
+                "unavailable": unavailable,
+            }
+        if unavailable:
+            return {
+                "allow": True,
+                "reason": "checker_unavailable_advisory",
+                "score": round(max(0.0, score - CHECKER_UNAVAILABLE_PENALTY), 4),
+                "advisory": True,
+                "unavailable": True,
+            }
+        if not approved:
+            sized = adjusted if adjusted > 0 else max(0.0, score - CHECKER_SOFT_REJECT_PENALTY)
+            return {
+                "allow": True,
+                "reason": "checker_soft_reject_advisory",
+                "score": round(min(score, sized), 4),
+                "advisory": True,
+                "unavailable": False,
+            }
+        return {
+            "allow": True,
+            "reason": "checker_approved",
+            "score": round(adjusted if adjusted > 0 else score, 4),
+            "advisory": False,
+            "unavailable": False,
+        }
+
+    if not approved:
+        return {
+            "allow": False,
+            "reason": "checker_rejected",
+            "score": 0.0,
+            "advisory": False,
+            "unavailable": unavailable,
+        }
+    return {
+        "allow": True,
+        "reason": "checker_approved",
+        "score": round(adjusted if adjusted > 0 else score, 4),
+        "advisory": False,
+        "unavailable": False,
     }

@@ -26,7 +26,7 @@ from .crypto.auditor import Auditor
 from .crypto.crypto_checker import CryptoChecker
 from .crypto.crypto_executor import CryptoExecutor, ExecutionFailed
 from .crypto.crypto_pulse import CryptoPulse
-from .crypto.crypto_scoring import score_token
+from .crypto.crypto_scoring import apply_crypto_checker, score_token
 from .crypto.narrative import Narrative
 from .crypto.scout import Scout
 from .models import Allocation, Market, Position
@@ -186,24 +186,37 @@ class TradingDesk:
             {"token": token.model_dump(mode="json"), "audit": audit,
              "narrative": narrative, "pulse": pulse, "score": verdict}
         )
+        paper = bool(getattr(self.crypto_executor, "paper", True))
+        gate = apply_crypto_checker(check, paper=paper, matrix_score=verdict["score"])
         agent_scores["checker"] = check
+        agent_scores["checker_gate"] = gate
         agent_scores["citations"] += self.crypto_checker.last_citations
         self.maybe_report_costs()
-        if not check["approve"]:
-            self.log.skip(Market.CRYPTO.value, token.symbol or token.mint, "checker_rejected",
-                          {"kill_reasons": check["kill_reasons"]})
+        if not gate["allow"]:
+            self.log.skip(
+                Market.CRYPTO.value,
+                token.symbol or token.mint,
+                "checker_rejected",
+                {
+                    "kill_reasons": check.get("kill_reasons"),
+                    "hard_reject": bool(check.get("hard_reject")),
+                    "paper": paper,
+                    "unavailable": gate["unavailable"],
+                },
+            )
             return {"bought": False, "reason": "checker_rejected"}
 
-        return await self._open_crypto(token, verdict, check, agent_scores)
+        return await self._open_crypto(token, verdict, check, agent_scores, size_score=gate["score"])
 
-    async def _open_crypto(self, token, verdict, check, agent_scores) -> dict[str, Any]:
+    async def _open_crypto(self, token, verdict, check, agent_scores, size_score: float | None = None) -> dict[str, Any]:
         async with self._lock:
             allowed, reason = self.risk.can_open(Market.CRYPTO, self.positions)
             if not allowed:
                 self.log.skip(Market.CRYPTO.value, token.symbol or token.mint, reason)
                 return {"bought": False, "reason": reason}
 
-            amount = self.risk.position_size(Market.CRYPTO, score=check["adjusted_score"] or verdict["score"])
+            sized = verdict["score"] if size_score is None else size_score
+            amount = self.risk.position_size(Market.CRYPTO, score=sized)
             if amount <= 0:
                 self.log.skip(Market.CRYPTO.value, token.symbol or token.mint, "size_zero")
                 return {"bought": False, "reason": "size_zero"}
